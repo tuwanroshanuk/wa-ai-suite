@@ -5,7 +5,6 @@ import { advanceFlow } from "../services/flowEngine.js";
 import {
   handleIncomingCall,
   handleCallTerminated,
-  rejectIncomingCall,
 } from "../services/callHandler.js";
 import { emitToDashboard } from "../sockets.js";
 
@@ -49,8 +48,6 @@ router.post("/", verifySignature, async (req, res) => {
   res.sendStatus(200);
 
   try {
-    // A payload may contain multiple entries and changes. Processing only [0]
-    // can silently drop call lifecycle events and leave incorrect statuses.
     for (const entry of req.body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change?.value;
@@ -121,6 +118,9 @@ async function handleInboundMessage(value, msg) {
     type: msg.type,
   });
 
+  // bot_enabled controls automatic MESSAGE replies only. It must never reject
+  // a customer-initiated voice call; calls still need to ring agents and may
+  // fall back to the call AI according to the call routing policy.
   if (contact.bot_enabled && conversation.status === "open") {
     await advanceFlow(conversation, contact, text);
   }
@@ -140,10 +140,9 @@ async function handleCallEvent(call) {
     }
 
     const contact = await getOrCreateContact(fromWaId);
-    if (!contact.bot_enabled) {
-      await rejectIncomingCall(waCallId, "bot_disabled");
-      return;
-    }
+    console.log(
+      `[call ${waCallId}] inbound call accepted for routing; contact=${contact.wa_id} message_bot_enabled=${contact.bot_enabled}`
+    );
 
     const offerSdp = call.session?.sdp;
     if (!offerSdp) {
@@ -155,8 +154,6 @@ async function handleCallEvent(call) {
     return;
   }
 
-  // Preserve Meta's final outcome instead of collapsing every event into
-  // one generic termination path.
   if (event === "terminate") {
     await handleCallTerminated(waCallId, "terminate");
     return;
