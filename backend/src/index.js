@@ -5,6 +5,7 @@ import http from "http";
 import { initDb } from "./db/index.js";
 import { requireAuth } from "./middleware/auth.js";
 import { initSockets } from "./sockets.js";
+import { expressCorsOptions } from "./config/cors.js";
 
 import authRoutes, { bootstrapAdmin } from "./routes/auth.js";
 import webhookRoutes from "./routes/webhook.js";
@@ -16,8 +17,12 @@ import audioRoutes from "./routes/audio.js";
 import { reconcileStaleCalls } from "./services/callHandler.js";
 
 const app = express();
+const corsOptions = expressCorsOptions();
 
-app.use(cors());
+// Apply CORS before auth and every API route so browser preflight requests
+// from the dashboard are answered without requiring a JWT.
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 
 // Capture the raw body for webhook signature verification, while still
 // parsing JSON everywhere else.
@@ -50,9 +55,6 @@ const PORT = process.env.PORT || 4000;
 async function start() {
   await initDb();
   await bootstrapAdmin();
-  // Close out any calls left "ringing"/"connected" by a previous process
-  // lifetime (deploy, crash, restart) before accepting new traffic - see
-  // the comment on reconcileStaleCalls in services/callHandler.js.
   await reconcileStaleCalls();
   server.listen(PORT, () => console.log(`[server] listening on :${PORT}`));
 }
