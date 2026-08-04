@@ -5,6 +5,7 @@ import Dashboard from "./pages/Dashboard.jsx";
 import Conversations from "./pages/Conversations.jsx";
 import FlowBuilder from "./pages/FlowBuilder.jsx";
 import Calls from "./pages/Calls.jsx";
+import AIAgent from "./pages/AIAgent.jsx";
 import Settings from "./pages/Settings.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import IncomingCallOverlay from "./components/IncomingCallOverlay.jsx";
@@ -29,6 +30,7 @@ export default function App() {
       <Route path="/conversations" element={<Protected><Conversations /></Protected>} />
       <Route path="/flows" element={<Protected><FlowBuilder /></Protected>} />
       <Route path="/calls" element={<Protected><Calls /></Protected>} />
+      <Route path="/ai-agent" element={<Protected><AIAgent /></Protected>} />
       <Route path="/settings" element={<Protected><Settings /></Protected>} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
