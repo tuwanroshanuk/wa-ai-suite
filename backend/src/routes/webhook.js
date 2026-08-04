@@ -27,10 +27,17 @@ router.get("/", (req, res) => {
 function verifySignature(req, res, next) {
   const signature = req.headers["x-hub-signature-256"];
   const appSecret = process.env.WHATSAPP_APP_SECRET;
-  if (!appSecret || !signature) return next(); // allow through in dev if not configured
+  if (!appSecret || !signature) return next();
+
   const expected =
     "sha256=" + crypto.createHmac("sha256", appSecret).update(req.rawBody || "").digest("hex");
-  if (signature !== expected) {
+
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (
+    actualBuffer.length !== expectedBuffer.length ||
+    !crypto.timingSafeEqual(actualBuffer, expectedBuffer)
+  ) {
     console.warn("[webhook] signature mismatch");
     return res.sendStatus(401);
   }
@@ -38,29 +45,25 @@ function verifySignature(req, res, next) {
 }
 
 router.post("/", verifySignature, async (req, res) => {
-  // Always ack fast; WhatsApp retries aggressively on non-2xx / slow responses.
+  // Acknowledge immediately; Meta retries slow or non-2xx webhooks.
   res.sendStatus(200);
 
   try {
-    const entry = req.body.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
-    if (!value) return;
+    // A payload may contain multiple entries and changes. Processing only [0]
+    // can silently drop call lifecycle events and leave incorrect statuses.
+    for (const entry of req.body.entry || []) {
+      for (const change of entry.changes || []) {
+        const value = change?.value;
+        if (!value) continue;
 
-    if (value.messages) {
-      for (const msg of value.messages) {
-        await handleInboundMessage(value, msg);
+        for (const msg of value.messages || []) {
+          await handleInboundMessage(value, msg);
+        }
+
+        for (const call of value.calls || []) {
+          await handleCallEvent(call);
+        }
       }
-    }
-
-    if (value.calls) {
-      for (const call of value.calls) {
-        await handleCallEvent(value, call);
-      }
-    }
-
-    if (value.statuses) {
-      // Delivery/read receipts for messages you sent - extend as needed.
     }
   } catch (err) {
     console.error("[webhook] error handling payload", err);
@@ -70,6 +73,7 @@ router.post("/", verifySignature, async (req, res) => {
 async function getOrCreateContact(waId, profileName) {
   const existing = await query("SELECT * FROM contacts WHERE wa_id = $1", [waId]);
   if (existing.rows.length) return existing.rows[0];
+
   const inserted = await query(
     "INSERT INTO contacts (wa_id, name) VALUES ($1,$2) RETURNING *",
     [waId, profileName || null]
@@ -83,6 +87,7 @@ async function getOrCreateConversation(contactId) {
     [contactId]
   );
   if (existing.rows.length) return existing.rows[0];
+
   const inserted = await query(
     "INSERT INTO conversations (contact_id) VALUES ($1) RETURNING *",
     [contactId]
@@ -121,31 +126,50 @@ async function handleInboundMessage(value, msg) {
   }
 }
 
-async function handleCallEvent(value, call) {
+async function handleCallEvent(call) {
   const waCallId = call.id;
-  const event = call.event; // e.g. 'connect' | 'terminate' | 'permission_denied' etc.
+  const event = call.event;
   const fromWaId = call.from;
 
+  console.log(`[call ${waCallId}] webhook event: ${event}`);
+
   if (event === "connect") {
+    if (!fromWaId) {
+      console.warn(`[call ${waCallId}] connect event missing caller id`);
+      return;
+    }
+
     const contact = await getOrCreateContact(fromWaId);
     if (!contact.bot_enabled) {
-      // No bot handling configured for this contact -> reject or route to a human queue.
       await rejectIncomingCall(waCallId, "bot_disabled");
       return;
     }
+
     const offerSdp = call.session?.sdp;
-    if (!offerSdp) return;
-    await handleIncomingCall({ waCallId, fromWaId, offerSdp, contact });
+    if (!offerSdp) {
+      console.warn(`[call ${waCallId}] connect event missing SDP offer`);
+      return;
+    }
+
+    await handleIncomingCall({ waCallId, offerSdp, contact });
+    return;
   }
 
-  if (event === "terminate" || event === "reject" || event === "timeout") {
-    await handleCallTerminated(waCallId);
+  // Preserve Meta's final outcome instead of collapsing every event into
+  // one generic termination path.
+  if (event === "terminate") {
+    await handleCallTerminated(waCallId, "terminate");
+    return;
+  }
+
+  if (event === "reject") {
+    await handleCallTerminated(waCallId, "reject");
+    return;
+  }
+
+  if (event === "timeout") {
+    await handleCallTerminated(waCallId, "timeout");
   }
 }
-
-// NOTE: outbound call-permission requests are handled by the authenticated
-// POST /api/calls/request-permission route (see routes/calls.js). A second,
-// unauthenticated copy used to live here (mounted under public /webhook) -
-// removed since it let anyone trigger WhatsApp template sends without login.
 
 export default router;
