@@ -20,6 +20,7 @@ const AGENT_RING_TIMEOUT_MS = Number(process.env.AGENT_RING_TIMEOUT_MS || 15000)
 const ICE_MIN_PORT = Number(process.env.WEBRTC_ICE_MIN_PORT || 50000);
 const ICE_MAX_PORT = Number(process.env.WEBRTC_ICE_MAX_PORT || 50010);
 const FAST_ICE_WAIT_MS = Number(process.env.WEBRTC_FAST_ICE_WAIT_MS || 200);
+const AGENT_ICE_WAIT_MS = Number(process.env.WEBRTC_AGENT_ICE_WAIT_MS || 1200);
 const sessions = new Map();
 
 function makePeerConnection() {
@@ -52,14 +53,14 @@ function makePeerConnection() {
   return new RTCPeerConnection(config);
 }
 
-async function shortIceWait(pc) {
+async function waitForIce(pc, timeoutMs) {
   if (pc.iceGatheringState === "complete") return;
   await new Promise((resolve) => {
     let subscription;
     const timer = setTimeout(() => {
       subscription?.unSubscribe?.();
       resolve();
-    }, FAST_ICE_WAIT_MS);
+    }, timeoutMs);
     subscription = pc.iceGatheringStateChange.subscribe((state) => {
       if (state !== "complete") return;
       clearTimeout(timer);
@@ -94,6 +95,10 @@ function noRecording() {
   };
 }
 
+function closePeer(pc) {
+  try { pc?.close(); } catch (_) {}
+}
+
 export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
   if (sessions.has(waCallId)) return sessions.get(waCallId).call;
 
@@ -114,6 +119,8 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
 
   let pc;
   let recording = noRecording();
+  let sessionRef = null;
+
   try {
     console.log(`[call ${waCallId}] preparing WebRTC answer`);
     pc = makePeerConnection();
@@ -122,17 +129,23 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
 
     pc.onTrack.subscribe((track) => {
       if (track.kind !== "audio") return;
-      track.onReceiveRtp.subscribe((rtp) => recording.feed(rtp));
+      console.log(`[call ${waCallId}] WhatsApp inbound audio track received`);
+      if (sessionRef) sessionRef.whatsappInboundTrack = track;
+      track.onReceiveRtp.subscribe((rtp) => {
+        recording.feed(rtp);
+        // Forward the caller's audio into the agent's browser WebRTC leg.
+        try { sessionRef?.agentOutboundTrack?.writeRtp(rtp); } catch (_) {}
+      });
     });
 
     pc.connectionStateChange.subscribe((state) => {
-      console.log(`[call ${waCallId}] WebRTC state: ${state}`);
+      console.log(`[call ${waCallId}] WhatsApp WebRTC state: ${state}`);
     });
 
     await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
     await pc.setLocalDescription(await pc.createAnswer());
+    await waitForIce(pc, FAST_ICE_WAIT_MS);
 
-    await shortIceWait(pc);
     if (!pc.localDescription?.sdp) throw new Error("WebRTC answer SDP was not generated");
 
     const session = {
@@ -140,18 +153,22 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
       call,
       recording,
       outboundTrack,
+      whatsappInboundTrack: null,
+      agentPc: null,
+      agentOutboundTrack: null,
       contact,
       ringTimer: null,
       decided: false,
+      acceptedBy: null,
     };
+    sessionRef = session;
     sessions.set(waCallId, session);
 
-    // Call signalling must take priority over optional recording startup.
-    // Previously, a missing FFmpeg binary crashed Node before pre_accept.
     console.log(`[call ${waCallId}] sending pre_accept immediately`);
     await preAcceptCall(waCallId, pc.localDescription.sdp);
     console.log(`[call ${waCallId}] pre_accept completed`);
 
+    // Recording is optional and must never block call signalling.
     recording = startRecording(waCallId);
     session.recording = recording;
 
@@ -182,36 +199,96 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
       stack: err.stack,
     });
     recording.stop();
-    try { pc?.close(); } catch (_) {}
+    closePeer(pc);
     await failCall(waCallId, call.id, err);
     throw err;
   }
 }
 
-export async function claimCallAsAgent(waCallId, user) {
+/**
+ * Creates a second WebRTC leg between the agent's browser and this backend.
+ * Browser microphone RTP is forwarded into WhatsApp, and WhatsApp caller RTP
+ * is forwarded into a server-generated audio track returned to the browser.
+ */
+export async function claimCallAsAgent(waCallId, user, browserOfferSdp) {
   const session = sessions.get(waCallId);
   if (!session || session.decided) throw new Error("Call is no longer available.");
+  if (!browserOfferSdp) throw new Error("Browser microphone WebRTC offer is required.");
 
   session.decided = true;
   clearTimeout(session.ringTimer);
+
+  let agentPc;
   try {
+    console.log(`[call ${waCallId}] preparing browser audio bridge for agent ${user.id}`);
+    agentPc = makePeerConnection();
+    const agentOutboundTrack = new MediaStreamTrack({ kind: "audio" });
+    agentPc.addTransceiver(agentOutboundTrack, { direction: "sendrecv" });
+
+    agentPc.onTrack.subscribe((track) => {
+      if (track.kind !== "audio") return;
+      console.log(`[call ${waCallId}] agent microphone track received`);
+      track.onReceiveRtp.subscribe((rtp) => {
+        // Forward browser microphone RTP to the WhatsApp caller.
+        try { session.outboundTrack.writeRtp(rtp); } catch (_) {}
+      });
+    });
+
+    agentPc.connectionStateChange.subscribe((state) => {
+      console.log(`[call ${waCallId}] agent WebRTC state: ${state}`);
+      emitToDashboard("call:agent-media", {
+        id: session.call.id,
+        waCallId,
+        state,
+      });
+    });
+
+    await agentPc.setRemoteDescription({ type: "offer", sdp: browserOfferSdp });
+    await agentPc.setLocalDescription(await agentPc.createAnswer());
+    await waitForIce(agentPc, AGENT_ICE_WAIT_MS);
+
+    if (!agentPc.localDescription?.sdp) {
+      throw new Error("Agent WebRTC answer SDP was not generated.");
+    }
+
+    session.agentPc = agentPc;
+    session.agentOutboundTrack = agentOutboundTrack;
+    session.acceptedBy = `agent:${user.id}`;
+
     await acceptCall(waCallId);
-    const connected = await waitForConnected(session.pc);
-    const handledBy = `agent:${user.id}`;
+
+    const handledBy = session.acceptedBy;
     const result = await query(
       "UPDATE calls SET status='connected',handled_by=$1 WHERE id=$2 RETURNING *",
       [handledBy, session.call.id]
     );
+
     emitToDashboard("call:updated", {
       id: session.call.id,
       waCallId,
       status: "connected",
       handled_by: handledBy,
-      media_connected: connected,
     });
-    return result.rows[0] || session.call;
+
+    console.log(`[call ${waCallId}] agent accepted; browser bridge SDP returned`);
+    return {
+      call: result.rows[0] || session.call,
+      answerSdp: agentPc.localDescription.sdp,
+    };
   } catch (err) {
-    await failCall(waCallId, session.call.id, err);
+    closePeer(agentPc);
+    session.agentPc = null;
+    session.agentOutboundTrack = null;
+    session.acceptedBy = null;
+    session.decided = false;
+
+    // Do not reject the customer when the browser microphone setup fails.
+    // Hand the still-ringing call to the AI fallback instead.
+    setImmediate(() => {
+      answerWithBot(waCallId).catch((botErr) =>
+        console.error(`[call ${waCallId}] agent bridge and AI fallback failed`, botErr)
+      );
+    });
     throw err;
   }
 }
@@ -222,9 +299,11 @@ export async function answerWithBot(waCallId) {
 
   session.decided = true;
   clearTimeout(session.ringTimer);
+
   try {
     console.log(`[call ${waCallId}] sending final accept for AI bot`);
     await acceptCall(waCallId);
+    session.acceptedBy = "bot";
     await query("UPDATE calls SET status='connected',handled_by='bot' WHERE id=$1", [
       session.call.id,
     ]);
@@ -234,21 +313,33 @@ export async function answerWithBot(waCallId) {
       status: "connected",
       handled_by: "bot",
     });
+  } catch (err) {
+    console.error(`[call ${waCallId}] bot could not accept call`, {
+      status: err.response?.status,
+      data: err.response?.data,
+      message: err.message,
+    });
+    await failCall(waCallId, session.call.id, err);
+    return;
+  }
 
-    const connected = await waitForConnected(session.pc);
-    console.log(`[call ${waCallId}] media connected=${connected}`);
+  const connected = await waitForConnected(session.pc);
+  console.log(`[call ${waCallId}] media connected=${connected}`);
+
+  // A TTS provider failure must not reject or terminate an already accepted
+  // call. Keep the media session alive and report the greeting failure only.
+  try {
     await playGreeting(
       waCallId,
       process.env.CALL_GREETING ||
         "Hi! Thanks for calling. This is our AI assistant. How can I help?"
     );
   } catch (err) {
-    console.error(`[call ${waCallId}] bot answer failed`, {
+    console.error(`[call ${waCallId}] greeting unavailable; call remains connected`, {
       status: err.response?.status,
       data: err.response?.data,
       message: err.message,
     });
-    await failCall(waCallId, session.call.id, err);
   }
 }
 
@@ -259,7 +350,8 @@ export async function handleCallTerminated(waCallId, outcome = "terminate") {
     clearTimeout(session.ringTimer);
     session.recording.stop();
     recordingPath = session.recording.outputPath;
-    try { session.pc.close(); } catch (_) {}
+    closePeer(session.agentPc);
+    closePeer(session.pc);
   }
 
   const existing = await query("SELECT id,status FROM calls WHERE wa_call_id=$1", [waCallId]);
@@ -292,7 +384,8 @@ export async function rejectIncomingCall(waCallId, reason) {
   if (session) {
     clearTimeout(session.ringTimer);
     session.recording.stop();
-    try { session.pc.close(); } catch (_) {}
+    closePeer(session.agentPc);
+    closePeer(session.pc);
   }
   try { await rejectCall(waCallId); } catch (_) {}
   const result = await query(
@@ -311,8 +404,9 @@ export async function rejectIncomingCall(waCallId, reason) {
 }
 
 export async function endCall(waCallId) {
-  await terminateCall(waCallId);
-  await handleCallTerminated(waCallId, "terminate");
+  try { await terminateCall(waCallId); } finally {
+    await handleCallTerminated(waCallId, "terminate");
+  }
 }
 
 async function failCall(waCallId, callId, err) {
@@ -320,7 +414,8 @@ async function failCall(waCallId, callId, err) {
   if (session) {
     clearTimeout(session.ringTimer);
     session.recording.stop();
-    try { session.pc.close(); } catch (_) {}
+    closePeer(session.agentPc);
+    closePeer(session.pc);
   }
   try { await rejectCall(waCallId); } catch (_) {}
   await query("UPDATE calls SET status='failed',ended_at=now() WHERE id=$1", [callId]);
@@ -356,7 +451,7 @@ async function playGreeting(waCallId, text) {
   const session = sessions.get(waCallId);
   if (!session) return;
 
-  const mp3 = await synthesize(text);
+  const audio = await synthesize(text);
   const udp = dgram.createSocket("udp4");
   const port = 30000 + Math.floor(Math.random() * 9000);
   await new Promise((resolve, reject) => {
@@ -385,22 +480,17 @@ async function playGreeting(waCallId, text) {
     console.error(`[call ${waCallId}] ffmpeg TTS: ${data.toString().trim()}`)
   );
 
-  const completed = new Promise((resolve) => {
-    ffmpeg.once("close", () => resolve(true));
-    ffmpeg.once("error", (err) => {
-      console.error(`[call ${waCallId}] could not start FFmpeg for TTS`, err);
-      resolve(false);
-    });
+  const completed = new Promise((resolve, reject) => {
+    ffmpeg.once("close", (code) => code === 0 ? resolve() : reject(new Error(`FFmpeg exited ${code}`)));
+    ffmpeg.once("error", reject);
   });
 
+  ffmpeg.stdin?.end(audio);
   try {
-    ffmpeg.stdin?.end(mp3);
-  } catch (err) {
-    console.error(`[call ${waCallId}] could not provide TTS audio to FFmpeg`, err);
+    await completed;
+  } finally {
+    try { udp.close(); } catch (_) {}
   }
-
-  await completed;
-  try { udp.close(); } catch (_) {}
   console.log(`[call ${waCallId}] TTS greeting streaming finished`);
 }
 
