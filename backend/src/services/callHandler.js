@@ -45,9 +45,6 @@ function makePeerConnection() {
     },
   };
 
-  // On a Docker host the public address is not a local interface. Werift can
-  // still advertise it as an additional host candidate while binding UDP on
-  // the container interface. Set this to the VPS public IPv4 in Dokploy.
   if (process.env.WEBRTC_PUBLIC_IP) {
     config.iceAdditionalHostAddresses = [process.env.WEBRTC_PUBLIC_IP];
   }
@@ -89,6 +86,14 @@ async function waitForConnected(pc, timeoutMs = 5000) {
   });
 }
 
+function noRecording() {
+  return {
+    outputPath: null,
+    feed() {},
+    stop() {},
+  };
+}
+
 export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
   if (sessions.has(waCallId)) return sessions.get(waCallId).call;
 
@@ -108,13 +113,12 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
   }
 
   let pc;
-  let recording;
+  let recording = noRecording();
   try {
     console.log(`[call ${waCallId}] preparing WebRTC answer`);
     pc = makePeerConnection();
     const outboundTrack = new MediaStreamTrack({ kind: "audio" });
     pc.addTransceiver(outboundTrack, { direction: "sendrecv" });
-    recording = startRecording(waCallId);
 
     pc.onTrack.subscribe((track) => {
       if (track.kind !== "audio") return;
@@ -128,10 +132,6 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
     await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
     await pc.setLocalDescription(await pc.createAnswer());
 
-    // Meta is terminating these calls around 1–2 seconds after CONNECT. The
-    // old code waited up to 8 seconds for ICE before pre_accept, so Meta never
-    // received a response in time. Give gathering only a tiny head start and
-    // pre_accept immediately with the current SDP.
     await shortIceWait(pc);
     if (!pc.localDescription?.sdp) throw new Error("WebRTC answer SDP was not generated");
 
@@ -146,9 +146,14 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
     };
     sessions.set(waCallId, session);
 
+    // Call signalling must take priority over optional recording startup.
+    // Previously, a missing FFmpeg binary crashed Node before pre_accept.
     console.log(`[call ${waCallId}] sending pre_accept immediately`);
     await preAcceptCall(waCallId, pc.localDescription.sdp);
     console.log(`[call ${waCallId}] pre_accept completed`);
+
+    recording = startRecording(waCallId);
+    session.recording = recording;
 
     if (getOnlineAgentCount() > 0) {
       emitToDashboard("call:incoming", {
@@ -176,7 +181,7 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
       message: err.message,
       stack: err.stack,
     });
-    if (recording) recording.stop();
+    recording.stop();
     try { pc?.close(); } catch (_) {}
     await failCall(waCallId, call.id, err);
     throw err;
@@ -375,16 +380,28 @@ async function playGreeting(waCallId, text) {
     "-application", "voip", "-frame_duration", "20", "-payload_type", "111",
     "-f", "rtp", `rtp://127.0.0.1:${port}`,
   ]);
-  ffmpeg.stdin.end(mp3);
-  ffmpeg.stderr.on("data", (data) =>
+
+  ffmpeg.stderr?.on("data", (data) =>
     console.error(`[call ${waCallId}] ffmpeg TTS: ${data.toString().trim()}`)
   );
-  await new Promise((resolve) => {
-    ffmpeg.once("close", resolve);
-    ffmpeg.once("error", resolve);
+
+  const completed = new Promise((resolve) => {
+    ffmpeg.once("close", () => resolve(true));
+    ffmpeg.once("error", (err) => {
+      console.error(`[call ${waCallId}] could not start FFmpeg for TTS`, err);
+      resolve(false);
+    });
   });
-  udp.close();
-  console.log(`[call ${waCallId}] TTS greeting streamed into WhatsApp call`);
+
+  try {
+    ffmpeg.stdin?.end(mp3);
+  } catch (err) {
+    console.error(`[call ${waCallId}] could not provide TTS audio to FFmpeg`, err);
+  }
+
+  await completed;
+  try { udp.close(); } catch (_) {}
+  console.log(`[call ${waCallId}] TTS greeting streaming finished`);
 }
 
 function startRecording(waCallId) {
@@ -392,24 +409,49 @@ function startRecording(waCallId) {
   const socket = dgram.createSocket("udp4");
   const outputPath = path.join(RECORDINGS_DIR, `${waCallId}.wav`);
   const sdpPath = path.join(RECORDINGS_DIR, `${waCallId}.sdp`);
-  fs.writeFileSync(
-    sdpPath,
-    [
-      "v=0", "o=- 0 0 IN IP4 127.0.0.1", "s=recording",
-      "c=IN IP4 127.0.0.1", "t=0 0", `m=audio ${udpPort} RTP/AVP 111`,
-      "a=rtpmap:111 opus/48000/2",
-    ].join("\n")
-  );
+  let enabled = true;
+  let stopped = false;
+
+  try {
+    fs.writeFileSync(
+      sdpPath,
+      [
+        "v=0", "o=- 0 0 IN IP4 127.0.0.1", "s=recording",
+        "c=IN IP4 127.0.0.1", "t=0 0", `m=audio ${udpPort} RTP/AVP 111`,
+        "a=rtpmap:111 opus/48000/2",
+      ].join("\n")
+    );
+  } catch (err) {
+    console.error(`[call ${waCallId}] recording SDP could not be created`, err);
+    try { socket.close(); } catch (_) {}
+    return noRecording();
+  }
+
   const ffmpeg = spawn("ffmpeg", [
     "-protocol_whitelist", "file,udp,rtp", "-i", sdpPath, "-y", outputPath,
   ]);
-  ffmpeg.stderr.on("data", () => {});
+
+  ffmpeg.stderr?.on("data", () => {});
+  ffmpeg.once("error", (err) => {
+    enabled = false;
+    console.error(`[call ${waCallId}] recording disabled because FFmpeg could not start`, err);
+    try { socket.close(); } catch (_) {}
+  });
+  ffmpeg.once("close", () => {
+    enabled = false;
+  });
+
   return {
-    outputPath,
+    get outputPath() {
+      return enabled || fs.existsSync(outputPath) ? outputPath : null;
+    },
     feed(rtp) {
+      if (!enabled || stopped) return;
       try { socket.send(rtp.serialize(), udpPort, "127.0.0.1"); } catch (_) {}
     },
     stop() {
+      if (stopped) return;
+      stopped = true;
       try { ffmpeg.kill("SIGINT"); } catch (_) {}
       try { socket.close(); } catch (_) {}
     },
