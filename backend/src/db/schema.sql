@@ -45,7 +45,6 @@ CREATE TABLE IF NOT EXISTS flows (
   name TEXT NOT NULL,
   is_active BOOLEAN DEFAULT false,
   is_default_greeting BOOLEAN DEFAULT false,
-  -- Flow graph: { nodes: [...], edges: [...] } built by the React Flow UI
   graph JSONB NOT NULL DEFAULT '{"nodes":[],"edges":[]}',
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now()
@@ -55,10 +54,10 @@ CREATE TABLE IF NOT EXISTS calls (
   id SERIAL PRIMARY KEY,
   contact_id INTEGER REFERENCES contacts(id) ON DELETE CASCADE,
   wa_call_id TEXT UNIQUE,
-  direction TEXT NOT NULL, -- inbound | outbound
-  handled_by TEXT NOT NULL DEFAULT 'bot', -- unassigned | bot | agent:<id>
-  status TEXT NOT NULL DEFAULT 'ringing', -- ringing | connected | ended | rejected | missed | failed
-  consent_status TEXT DEFAULT 'not_required', -- not_required | requested | granted | denied
+  direction TEXT NOT NULL,
+  handled_by TEXT NOT NULL DEFAULT 'bot',
+  status TEXT NOT NULL DEFAULT 'ringing',
+  consent_status TEXT DEFAULT 'not_required',
   recording_path TEXT,
   transcript JSONB DEFAULT '[]',
   started_at TIMESTAMPTZ DEFAULT now(),
@@ -68,7 +67,7 @@ CREATE TABLE IF NOT EXISTS calls (
 CREATE TABLE IF NOT EXISTS audio_assets (
   id SERIAL PRIMARY KEY,
   name TEXT NOT NULL,
-  file_path TEXT NOT NULL, -- pre-recorded free audio clips (greetings, menus)
+  file_path TEXT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
@@ -93,5 +92,5 @@ CREATE INDEX IF NOT EXISTS idx_conversations_contact ON conversations(contact_id
 CREATE INDEX IF NOT EXISTS idx_calls_contact ON calls(contact_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_active ON knowledge_entries(is_active, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_knowledge_search ON knowledge_entries USING GIN (
-  to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(content,'') || ' ' || array_to_string(tags,' '))
+  to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(content,''))
 );
