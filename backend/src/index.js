@@ -14,6 +14,7 @@ import contactRoutes from "./routes/contacts.js";
 import flowRoutes from "./routes/flows.js";
 import callRoutes from "./routes/calls.js";
 import audioRoutes from "./routes/audio.js";
+import voiceSettingsRoutes from "./routes/voiceSettings.js";
 import { reconcileStaleCalls } from "./services/callHandler.js";
 
 const app = express();
@@ -46,6 +47,7 @@ app.use("/api/contacts", requireAuth, contactRoutes);
 app.use("/api/flows", requireAuth, flowRoutes);
 app.use("/api/calls", requireAuth, callRoutes);
 app.use("/api/audio", requireAuth, audioRoutes);
+app.use("/api/voice-settings", requireAuth, voiceSettingsRoutes);
 
 const server = http.createServer(app);
 initSockets(server);
