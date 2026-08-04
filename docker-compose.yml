@@ -35,9 +35,9 @@ services:
       - REDIS_URL=redis://redis:6379
       - TTS_SERVICE_URL=http://tts-service:6000
       - WEBRTC_ICE_MIN_PORT=50000
-      - WEBRTC_ICE_MAX_PORT=50100
+      - WEBRTC_ICE_MAX_PORT=50010
     ports:
-      - "50000-50100:50000-50100/udp"
+      - "50000-50010:50000-50010/udp"
     volumes:
       - recordings:/app/recordings
 
