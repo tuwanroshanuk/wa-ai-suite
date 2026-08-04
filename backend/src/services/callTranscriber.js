@@ -52,14 +52,20 @@ function wavFromPcm(pcm) {
   return Buffer.concat([header, pcm]);
 }
 
+async function allocateUdpPort() {
+  const probe = dgram.createSocket("udp4");
+  await new Promise((resolve, reject) => {
+    probe.once("error", reject);
+    probe.bind(0, "127.0.0.1", resolve);
+  });
+  const port = probe.address().port;
+  await new Promise((resolve) => probe.close(resolve));
+  return port;
+}
+
 export async function startLiveTranscriber({ waCallId, recordingsDir, onTurn }) {
   const socket = dgram.createSocket("udp4");
-  await new Promise((resolve, reject) => {
-    socket.once("error", reject);
-    socket.bind(0, "127.0.0.1", resolve);
-  });
-
-  const udpPort = socket.address().port;
+  const udpPort = await allocateUdpPort();
   const sdpPath = path.join(recordingsDir, `${safeName(waCallId)}.stt.sdp`);
   fs.writeFileSync(
     sdpPath,
