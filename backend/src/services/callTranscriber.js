@@ -63,8 +63,13 @@ async function allocateUdpPort() {
   return port;
 }
 
-export async function startLiveTranscriber({ waCallId, recordingsDir, onTurn }) {
-  const socket = dgram.createSocket("udp4");
+export async function startLiveTranscriber({
+  waCallId,
+  recordingsDir,
+  onTurn,
+  onPcmChunk,
+}) {
+  const sender = dgram.createSocket("udp4");
   const udpPort = await allocateUdpPort();
   const sdpPath = path.join(recordingsDir, `${safeName(waCallId)}.stt.sdp`);
   fs.writeFileSync(
@@ -77,17 +82,20 @@ export async function startLiveTranscriber({ waCallId, recordingsDir, onTurn }) 
       "t=0 0",
       `m=audio ${udpPort} RTP/AVP 111`,
       "a=rtpmap:111 opus/48000/2",
-    ].join("\n")
+      "a=fmtp:111 minptime=10;useinbandfec=1",
+      "a=recvonly",
+      "",
+    ].join("\r\n")
   );
 
   const ffmpeg = spawn("ffmpeg", [
     "-hide_banner",
-    "-loglevel", "error",
+    "-loglevel", "warning",
     "-protocol_whitelist", "file,udp,rtp",
     "-fflags", "nobuffer",
     "-flags", "low_delay",
     "-analyzeduration", "0",
-    "-probesize", "32",
+    "-probesize", "64",
     "-i", sdpPath,
     "-vn",
     "-acodec", "pcm_s16le",
@@ -98,6 +106,7 @@ export async function startLiveTranscriber({ waCallId, recordingsDir, onTurn }) 
   ]);
 
   let stopped = false;
+  let ready = false;
   let speaking = false;
   let speechMs = 0;
   let silenceMs = 0;
@@ -105,6 +114,7 @@ export async function startLiveTranscriber({ waCallId, recordingsDir, onTurn }) 
   let preRollBuffers = [];
   let preRollBytes = 0;
   const maxPreRollBytes = Math.floor((PRE_ROLL_MS / 1000) * SAMPLE_RATE * BYTES_PER_SAMPLE);
+  const pendingRtp = [];
   let turnQueue = Promise.resolve();
 
   function resetTurn() {
@@ -131,6 +141,7 @@ export async function startLiveTranscriber({ waCallId, recordingsDir, onTurn }) 
 
     const pcm = Buffer.concat(speechBuffers);
     resetTurn();
+    if (typeof onTurn !== "function") return;
     const wav = wavFromPcm(pcm);
     turnQueue = turnQueue
       .then(() => onTurn(wav))
@@ -139,6 +150,12 @@ export async function startLiveTranscriber({ waCallId, recordingsDir, onTurn }) 
 
   ffmpeg.stdout.on("data", (chunk) => {
     if (stopped || !chunk?.length) return;
+
+    // Gemini Live accepts the same raw little-endian 16-bit 16kHz PCM stream.
+    try { onPcmChunk?.(chunk); } catch (err) {
+      console.warn(`[call ${waCallId}] live PCM consumer failed`, err.message);
+    }
+
     const chunkMs = durationMs(chunk);
     const voiced = calculateRms(chunk) >= RMS_THRESHOLD;
 
@@ -169,30 +186,43 @@ export async function startLiveTranscriber({ waCallId, recordingsDir, onTurn }) 
     const text = data.toString().trim();
     if (text) console.warn(`[call ${waCallId}] STT decoder: ${text}`);
   });
-
   ffmpeg.once("error", (err) => {
     console.error(`[call ${waCallId}] live transcription decoder failed`, err);
   });
-
   ffmpeg.once("close", (code) => {
     if (!stopped && code !== 0) {
       console.warn(`[call ${waCallId}] live transcription decoder exited ${code}`);
     }
   });
 
-  console.log(`[call ${waCallId}] live caller transcription pipeline started`);
+  const readyTimer = setTimeout(() => {
+    if (stopped) return;
+    ready = true;
+    for (const packet of pendingRtp.splice(0)) {
+      try { sender.send(packet, udpPort, "127.0.0.1"); } catch (_) {}
+    }
+    console.log(`[call ${waCallId}] live caller audio decoder started on UDP ${udpPort}`);
+  }, 100);
 
   return {
     feed(rtp) {
       if (stopped) return;
-      try { socket.send(rtp.serialize(), udpPort, "127.0.0.1"); } catch (_) {}
+      try {
+        const packet = rtp.serialize();
+        if (!ready) {
+          if (pendingRtp.length < 500) pendingRtp.push(packet);
+          return;
+        }
+        sender.send(packet, udpPort, "127.0.0.1");
+      } catch (_) {}
     },
     stop() {
       if (stopped) return;
       stopped = true;
+      clearTimeout(readyTimer);
       if (speaking) flushTurn();
       try { ffmpeg.kill("SIGINT"); } catch (_) {}
-      try { socket.close(); } catch (_) {}
+      try { sender.close(); } catch (_) {}
       try { fs.unlinkSync(sdpPath); } catch (_) {}
     },
   };
