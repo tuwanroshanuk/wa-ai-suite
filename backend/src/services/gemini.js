@@ -1,10 +1,12 @@
 import axios from "axios";
 
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 const AUDIO_MODEL = process.env.GEMINI_AUDIO_MODEL || MODEL;
+const STT_URL = process.env.STT_SERVICE_URL || "http://stt-service:7000";
+const STT_PROVIDER = String(process.env.STT_PROVIDER || "local").trim().toLowerCase();
 
-function assertConfigured() {
+function assertGeminiConfigured() {
   if (!API_KEY) throw new Error("GEMINI_API_KEY is not configured");
 }
 
@@ -15,7 +17,7 @@ function extractText(data, fallback = "") {
 }
 
 export async function generateReply(history, systemPrompt) {
-  assertConfigured();
+  assertGeminiConfigured();
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
 
   const contents = history.map((item) => ({
@@ -28,7 +30,9 @@ export async function generateReply(history, systemPrompt) {
     ...(systemPrompt
       ? { systemInstruction: { role: "system", parts: [{ text: systemPrompt }] } }
       : {}),
-    generationConfig: { temperature: 0.55, maxOutputTokens: 300 },
+    // Current Gemini 3.x models no longer require the deprecated sampling
+    // parameters used by the old 2.0 endpoint.
+    generationConfig: { maxOutputTokens: 300 },
   };
 
   const { data } = await axios.post(url, body, {
@@ -39,10 +43,18 @@ export async function generateReply(history, systemPrompt) {
   return extractText(data, "Sorry, I couldn't come up with a response.");
 }
 
-export async function transcribeAudio(audioBuffer, mimeType = "audio/wav") {
-  assertConfigured();
-  if (!audioBuffer?.length) return "";
+async function transcribeLocally(audioBuffer, mimeType) {
+  const { data } = await axios.post(`${STT_URL}/transcribe`, audioBuffer, {
+    headers: { "Content-Type": mimeType || "audio/wav" },
+    timeout: 120000,
+    maxContentLength: 25 * 1024 * 1024,
+    maxBodyLength: 25 * 1024 * 1024,
+  });
+  return String(data?.text || "").trim();
+}
 
+async function transcribeWithGemini(audioBuffer, mimeType) {
+  assertGeminiConfigured();
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${AUDIO_MODEL}:generateContent?key=${API_KEY}`;
   const body = {
     contents: [
@@ -64,10 +76,7 @@ export async function transcribeAudio(audioBuffer, mimeType = "audio/wav") {
         ],
       },
     ],
-    generationConfig: {
-      temperature: 0,
-      maxOutputTokens: 180,
-    },
+    generationConfig: { maxOutputTokens: 180 },
   };
 
   const { data } = await axios.post(url, body, {
@@ -78,4 +87,25 @@ export async function transcribeAudio(audioBuffer, mimeType = "audio/wav") {
   const transcript = extractText(data);
   if (!transcript || /^\[?NO[_ ]SPEECH\]?$/i.test(transcript)) return "";
   return transcript;
+}
+
+export async function transcribeAudio(audioBuffer, mimeType = "audio/wav") {
+  if (!audioBuffer?.length) return "";
+
+  if (STT_PROVIDER === "gemini") {
+    return transcribeWithGemini(audioBuffer, mimeType);
+  }
+
+  if (STT_PROVIDER === "auto") {
+    try {
+      return await transcribeLocally(audioBuffer, mimeType);
+    } catch (err) {
+      console.warn("[stt] local service failed; falling back to Gemini", err.message);
+      return transcribeWithGemini(audioBuffer, mimeType);
+    }
+  }
+
+  // Local is the production default. It has no request quota and prevents a
+  // Gemini billing/rate-limit problem from disabling live call transcripts.
+  return transcribeLocally(audioBuffer, mimeType);
 }
