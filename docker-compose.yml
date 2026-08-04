@@ -20,6 +20,10 @@ services:
     restart: unless-stopped
     environment:
       - PORT=6000
+      - TTS_PROVIDER=${TTS_PROVIDER:-auto}
+      - TTS_DEFAULT_VOICE=${TTS_DEFAULT_VOICE:-en-US-AriaNeural}
+      - TTS_ESPEAK_VOICE=${TTS_ESPEAK_VOICE:-en-us}
+      - TTS_ESPEAK_SPEED=${TTS_ESPEAK_SPEED:-165}
 
   backend:
     build: ./backend
