@@ -78,6 +78,20 @@ CREATE TABLE IF NOT EXISTS app_settings (
   updated_at TIMESTAMPTZ DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS knowledge_entries (
+  id SERIAL PRIMARY KEY,
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  tags TEXT[] NOT NULL DEFAULT '{}',
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ DEFAULT now()
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_contact ON conversations(contact_id);
 CREATE INDEX IF NOT EXISTS idx_calls_contact ON calls(contact_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_active ON knowledge_entries(is_active, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_knowledge_search ON knowledge_entries USING GIN (
+  to_tsvector('simple', coalesce(title,'') || ' ' || coalesce(content,'') || ' ' || array_to_string(tags,' '))
+);
