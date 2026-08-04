@@ -34,9 +34,10 @@ services:
       - DATABASE_URL=postgres://${POSTGRES_USER:-wa_user}:${POSTGRES_PASSWORD:-wa_pass}@postgres:5432/${POSTGRES_DB:-wa_suite}
       - REDIS_URL=redis://redis:6379
       - TTS_SERVICE_URL=http://tts-service:6000
+      - WEBRTC_ICE_MIN_PORT=50000
+      - WEBRTC_ICE_MAX_PORT=50100
     ports:
-      # WebRTC/ICE media. These UDP ports must also be allowed by the VDS firewall.
-      - "49152-65535:49152-65535/udp"
+      - "50000-50100:50000-50100/udp"
     volumes:
       - recordings:/app/recordings
 
