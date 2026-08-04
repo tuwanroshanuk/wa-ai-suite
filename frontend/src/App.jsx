@@ -7,6 +7,7 @@ import FlowBuilder from "./pages/FlowBuilder.jsx";
 import Calls from "./pages/Calls.jsx";
 import Settings from "./pages/Settings.jsx";
 import Sidebar from "./components/Sidebar.jsx";
+import IncomingCallOverlay from "./components/IncomingCallOverlay.jsx";
 
 function Protected({ children }) {
   const token = useAuthStore((s) => s.token);
@@ -15,6 +16,7 @@ function Protected({ children }) {
     <div className="layout">
       <Sidebar />
       <div className="main">{children}</div>
+      <IncomingCallOverlay />
     </div>
   );
 }
