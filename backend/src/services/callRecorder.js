@@ -37,54 +37,43 @@ function waitForExit(process, timeoutMs = 5000) {
   });
 }
 
-function writeRtpSdp(filePath, port, label) {
-  fs.writeFileSync(
-    filePath,
-    [
-      "v=0",
-      "o=- 0 0 IN IP4 127.0.0.1",
-      `s=${label}`,
-      "c=IN IP4 127.0.0.1",
-      "t=0 0",
-      `m=audio ${port} RTP/AVP 111`,
-      "a=rtpmap:111 opus/48000/2",
-      "a=fmtp:111 minptime=10;useinbandfec=1",
-      "a=recvonly",
-      "",
-    ].join("\r\n")
-  );
-}
-
 /**
- * Records both directions of the call into one finalized mono WAV:
- *   input 0 = WhatsApp caller
- *   input 1 = human agent, AI Live audio, or generated TTS sent to the caller
+ * Records the WhatsApp caller RTP stream as a finalized mono WAV file.
  *
- * FFmpeg is the only process bound to the RTP receiving ports. Node sends RTP
- * from separate ephemeral sockets, avoiding the old address-in-use/empty-file
- * failure. The recorder is awaited during call shutdown so the WAV header is
- * finalized before its path is stored in Postgres.
+ * FFmpeg is the only process bound to the RTP receiving port. Node sends RTP
+ * from a separate ephemeral socket, avoiding the old address-in-use/empty-file
+ * failure. Shutdown waits for FFmpeg to finalize the WAV header before the
+ * recording path is stored in Postgres.
  */
 export async function startCallRecorder({ waCallId, recordingsDir }) {
   fs.mkdirSync(recordingsDir, { recursive: true });
 
   const fileName = safeName(waCallId);
   const outputPath = path.join(recordingsDir, `${fileName}.wav`);
-  const inboundSdpPath = path.join(recordingsDir, `${fileName}.caller.sdp`);
-  const outboundSdpPath = path.join(recordingsDir, `${fileName}.assistant.sdp`);
-  const inboundPort = await reserveUdpPort();
-  let outboundPort = await reserveUdpPort();
-  while (outboundPort === inboundPort) outboundPort = await reserveUdpPort();
-
-  const inboundSender = dgram.createSocket("udp4");
-  const outboundSender = dgram.createSocket("udp4");
+  const sdpPath = path.join(recordingsDir, `${fileName}.recording.sdp`);
+  const udpPort = await reserveUdpPort();
+  const sender = dgram.createSocket("udp4");
   let stopped = false;
   let ready = false;
-  const pendingInbound = [];
-  const pendingOutbound = [];
+  let ffmpegError = null;
+  const pending = [];
 
-  writeRtpSdp(inboundSdpPath, inboundPort, "whatsapp-caller");
-  writeRtpSdp(outboundSdpPath, outboundPort, "business-audio");
+  fs.writeFileSync(
+    sdpPath,
+    [
+      "v=0",
+      "o=- 0 0 IN IP4 127.0.0.1",
+      "s=whatsapp-call-recording",
+      "c=IN IP4 127.0.0.1",
+      "t=0 0",
+      `m=audio ${udpPort} RTP/AVP 111`,
+      "a=rtpmap:111 opus/48000/2",
+      "a=fmtp:111 minptime=10;useinbandfec=1",
+      "a=recvonly",
+      "",
+    ].join("\r\n")
+  );
+
   try { fs.unlinkSync(outputPath); } catch (_) {}
 
   const ffmpeg = spawn("ffmpeg", [
@@ -94,15 +83,7 @@ export async function startCallRecorder({ waCallId, recordingsDir }) {
     "-fflags", "+genpts",
     "-use_wallclock_as_timestamps", "1",
     "-thread_queue_size", "1024",
-    "-i", inboundSdpPath,
-    "-protocol_whitelist", "file,udp,rtp",
-    "-fflags", "+genpts",
-    "-use_wallclock_as_timestamps", "1",
-    "-thread_queue_size", "1024",
-    "-i", outboundSdpPath,
-    "-filter_complex",
-    "[0:a]aresample=16000,asetpts=N/SR/TB[caller];[1:a]aresample=16000,asetpts=N/SR/TB[business];[caller][business]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,volume=0.78[mixed]",
-    "-map", "[mixed]",
+    "-i", sdpPath,
     "-vn",
     "-acodec", "pcm_s16le",
     "-ar", "16000",
@@ -111,7 +92,6 @@ export async function startCallRecorder({ waCallId, recordingsDir }) {
     outputPath,
   ]);
 
-  let ffmpegError = null;
   ffmpeg.stderr.on("data", (chunk) => {
     const message = chunk.toString().trim();
     if (message) console.warn(`[call ${waCallId}] recorder: ${message}`);
@@ -121,11 +101,16 @@ export async function startCallRecorder({ waCallId, recordingsDir }) {
     console.error(`[call ${waCallId}] recorder FFmpeg failed`, err);
   });
 
-  function sendPacket(sender, packet, port) {
-    try { sender.send(packet, port, "127.0.0.1"); } catch (_) {}
-  }
+  const readyTimer = setTimeout(() => {
+    if (stopped) return;
+    ready = true;
+    for (const packet of pending.splice(0)) {
+      try { sender.send(packet, udpPort, "127.0.0.1"); } catch (_) {}
+    }
+    console.log(`[call ${waCallId}] recording started on UDP ${udpPort}`);
+  }, 150);
 
-  function feed(rtp, sender, port, pending) {
+  function feedCallerRtp(rtp) {
     if (stopped || !rtp) return;
     try {
       const packet = rtp.serialize();
@@ -133,37 +118,17 @@ export async function startCallRecorder({ waCallId, recordingsDir }) {
         if (pending.length < 750) pending.push(packet);
         return;
       }
-      sendPacket(sender, packet, port);
+      sender.send(packet, udpPort, "127.0.0.1");
     } catch (_) {}
   }
 
-  // Let both FFmpeg UDP receivers bind before sending the queued RTP packets.
-  const readyTimer = setTimeout(() => {
-    if (stopped) return;
-    ready = true;
-    for (const packet of pendingInbound.splice(0)) {
-      sendPacket(inboundSender, packet, inboundPort);
-    }
-    for (const packet of pendingOutbound.splice(0)) {
-      sendPacket(outboundSender, packet, outboundPort);
-    }
-    console.log(
-      `[call ${waCallId}] two-way recording started caller=${inboundPort} business=${outboundPort}`
-    );
-  }, 180);
-
   return {
     outputPath,
-    // Backward-compatible alias for caller audio.
-    feed(rtp) {
-      feed(rtp, inboundSender, inboundPort, pendingInbound);
-    },
-    feedInbound(rtp) {
-      feed(rtp, inboundSender, inboundPort, pendingInbound);
-    },
-    feedOutbound(rtp) {
-      feed(rtp, outboundSender, outboundPort, pendingOutbound);
-    },
+    feed: feedCallerRtp,
+    feedInbound: feedCallerRtp,
+    // Reserved for a future dual-channel mix. Caller recording remains stable
+    // even when no business-side RTP is available.
+    feedOutbound() {},
     async stop() {
       if (stopped) {
         try {
@@ -177,10 +142,8 @@ export async function startCallRecorder({ waCallId, recordingsDir }) {
       clearTimeout(readyTimer);
       try { ffmpeg.kill("SIGINT"); } catch (_) {}
       await waitForExit(ffmpeg);
-      try { inboundSender.close(); } catch (_) {}
-      try { outboundSender.close(); } catch (_) {}
-      try { fs.unlinkSync(inboundSdpPath); } catch (_) {}
-      try { fs.unlinkSync(outboundSdpPath); } catch (_) {}
+      try { sender.close(); } catch (_) {}
+      try { fs.unlinkSync(sdpPath); } catch (_) {}
 
       if (ffmpegError) {
         try { fs.unlinkSync(outputPath); } catch (_) {}
@@ -190,7 +153,7 @@ export async function startCallRecorder({ waCallId, recordingsDir }) {
       try {
         const size = fs.statSync(outputPath).size;
         if (size > 44) {
-          console.log(`[call ${waCallId}] two-way recording finalized: ${size} bytes`);
+          console.log(`[call ${waCallId}] recording finalized: ${size} bytes`);
           return outputPath;
         }
       } catch (_) {}
