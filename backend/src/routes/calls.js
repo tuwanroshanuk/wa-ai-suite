@@ -44,10 +44,25 @@ router.get("/active", async (req, res) => {
 });
 
 router.get("/:id/recording", async (req, res) => {
-  const result = await query("SELECT recording_path FROM calls WHERE id = $1", [req.params.id]);
-  const filePath = result.rows[0]?.recording_path;
-  if (!filePath || !fs.existsSync(filePath)) return res.status(404).json({ error: "not found" });
-  res.sendFile(path.resolve(filePath));
+  const result = await query("SELECT recording_path FROM calls WHERE id=$1", [req.params.id]);
+  const storedPath = result.rows[0]?.recording_path;
+  if (!storedPath) return res.status(404).json({ error: "Recording is not available." });
+
+  const filePath = path.resolve(storedPath);
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size <= 44) {
+      return res.status(404).json({ error: "Recording is empty or was not finalized." });
+    }
+  } catch (_) {
+    return res.status(404).json({ error: "Recording file was not found." });
+  }
+
+  res.setHeader("Content-Type", "audio/wav");
+  res.setHeader("Content-Disposition", `inline; filename="call-${req.params.id}.wav"`);
+  res.setHeader("Cache-Control", "private, no-store");
+  res.setHeader("Accept-Ranges", "bytes");
+  return res.sendFile(filePath);
 });
 
 router.post("/request-permission", async (req, res) => {
@@ -64,11 +79,9 @@ router.post("/request-permission", async (req, res) => {
 
 router.post("/:id/answer", async (req, res) => {
   const { offerSdp } = req.body || {};
-  if (!offerSdp) {
-    return res.status(400).json({ error: "Microphone WebRTC offer is required" });
-  }
+  if (!offerSdp) return res.status(400).json({ error: "Microphone WebRTC offer is required" });
 
-  const result = await query("SELECT wa_call_id, status FROM calls WHERE id = $1", [req.params.id]);
+  const result = await query("SELECT wa_call_id,status FROM calls WHERE id=$1", [req.params.id]);
   const row = result.rows[0];
   if (!row) return res.status(404).json({ error: "Call not found" });
   if (row.status !== "ringing") {
@@ -86,7 +99,7 @@ router.post("/:id/answer", async (req, res) => {
 
 router.post("/:id/decline", async (req, res) => {
   const reason = String(req.body?.reason || "").trim().slice(0, 500);
-  const result = await query("SELECT wa_call_id, status FROM calls WHERE id = $1", [req.params.id]);
+  const result = await query("SELECT wa_call_id,status FROM calls WHERE id=$1", [req.params.id]);
   const row = result.rows[0];
   if (!row) return res.status(404).json({ error: "Call not found" });
   if (row.status !== "ringing") {
@@ -111,7 +124,7 @@ router.post("/:id/decline", async (req, res) => {
 
 router.post("/:id/transfer-to-bot", async (req, res) => {
   const reason = String(req.body?.reason || "").trim().slice(0, 500);
-  const result = await query("SELECT wa_call_id, status FROM calls WHERE id = $1", [req.params.id]);
+  const result = await query("SELECT wa_call_id,status FROM calls WHERE id=$1", [req.params.id]);
   const row = result.rows[0];
   if (!row) return res.status(404).json({ error: "Call not found" });
   if (!["ringing", "connected"].includes(row.status)) {
@@ -138,9 +151,10 @@ router.post("/:id/prompt-audio", async (req, res) => {
   const text = String(req.body?.text || "").trim().slice(0, 1000);
   if (!text) return res.status(400).json({ error: "Prompt text is required" });
 
-  const result = await query("SELECT wa_call_id, status, handled_by FROM calls WHERE id = $1", [
-    req.params.id,
-  ]);
+  const result = await query(
+    "SELECT wa_call_id,status,handled_by FROM calls WHERE id=$1",
+    [req.params.id]
+  );
   const row = result.rows[0];
   if (!row) return res.status(404).json({ error: "Call not found" });
   if (row.status !== "connected" || !String(row.handled_by).startsWith("agent:")) {
@@ -151,6 +165,7 @@ router.post("/:id/prompt-audio", async (req, res) => {
     const audio = await createAgentPromptAudio(row.wa_call_id, text, req.user);
     res.setHeader("Content-Type", audio.contentType);
     res.setHeader("X-TTS-Provider", audio.provider);
+    res.setHeader("X-TTS-Voice", audio.voice || "");
     res.setHeader("Cache-Control", "no-store");
     res.send(audio.audio);
   } catch (err) {
@@ -159,7 +174,7 @@ router.post("/:id/prompt-audio", async (req, res) => {
 });
 
 router.post("/:id/end", async (req, res) => {
-  const result = await query("SELECT wa_call_id, status FROM calls WHERE id = $1", [req.params.id]);
+  const result = await query("SELECT wa_call_id,status FROM calls WHERE id=$1", [req.params.id]);
   const row = result.rows[0];
   if (!row) return res.status(404).json({ error: "Call not found" });
   if (!["ringing", "connected"].includes(row.status)) {
@@ -175,7 +190,7 @@ router.post("/:id/end", async (req, res) => {
 });
 
 router.post("/:id/reject", async (req, res) => {
-  const result = await query("SELECT wa_call_id, status FROM calls WHERE id = $1", [req.params.id]);
+  const result = await query("SELECT wa_call_id,status FROM calls WHERE id=$1", [req.params.id]);
   const row = result.rows[0];
   if (!row) return res.status(404).json({ error: "Call not found" });
   if (row.status !== "ringing") {
