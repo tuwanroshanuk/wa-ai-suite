@@ -6,6 +6,17 @@ export default function IncomingCallOverlay() {
   const [incoming, setIncoming] = useState(null);
   const [busy, setBusy] = useState(false);
 
+  async function loadActiveCall() {
+    try {
+      const response = await api.get("/api/calls/active");
+      setIncoming(response.data || null);
+    } catch (err) {
+      // CORS/network errors are logged once by the browser. Keep the existing
+      // realtime popup instead of clearing it during a temporary reconnect.
+      console.warn("[calls] could not recover active call", err.message);
+    }
+  }
+
   useEffect(() => {
     const socket = getSocket();
 
@@ -23,9 +34,20 @@ export default function IncomingCallOverlay() {
       setIncoming((current) => (current?.id === payload.id ? null : current));
     };
 
+    const onConnect = () => {
+      loadActiveCall();
+    };
+
+    socket.on("connect", onConnect);
     socket.on("call:incoming", onIncoming);
     socket.on("call:updated", onUpdated);
+
+    // Recover a call that began while the page was refreshing or while
+    // Socket.IO was reconnecting.
+    loadActiveCall();
+
     return () => {
+      socket.off("connect", onConnect);
       socket.off("call:incoming", onIncoming);
       socket.off("call:updated", onUpdated);
     };
@@ -39,6 +61,12 @@ export default function IncomingCallOverlay() {
       await api.post(`/api/calls/${incoming.id}/answer`, {});
       setIncoming(null);
     } catch (err) {
+      if (err.response?.status === 409 || err.response?.status === 404) {
+        // The call ended or was handled while this tab was reconnecting.
+        setIncoming(null);
+        await loadActiveCall();
+        return;
+      }
       alert(err.response?.data?.error || err.message || "Could not answer the call.");
     } finally {
       setBusy(false);
@@ -51,6 +79,11 @@ export default function IncomingCallOverlay() {
       await api.post(`/api/calls/${incoming.id}/decline`, {});
       setIncoming(null);
     } catch (err) {
+      if (err.response?.status === 409 || err.response?.status === 404) {
+        setIncoming(null);
+        await loadActiveCall();
+        return;
+      }
       alert(err.response?.data?.error || err.message || "Could not decline the call.");
     } finally {
       setBusy(false);
