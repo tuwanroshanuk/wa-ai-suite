@@ -1,12 +1,13 @@
 import { Server } from "socket.io";
 import jwt from "jsonwebtoken";
+import { socketCorsOptions } from "./config/cors.js";
 
 let io;
 const connectedAgents = new Map();
 
 export function initSockets(httpServer) {
   io = new Server(httpServer, {
-    cors: { origin: "*" },
+    cors: socketCorsOptions(),
     transports: ["websocket", "polling"],
     pingTimeout: 20000,
     pingInterval: 10000,
