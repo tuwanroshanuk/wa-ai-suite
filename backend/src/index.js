@@ -13,6 +13,7 @@ import contactRoutes from "./routes/contacts.js";
 import flowRoutes from "./routes/flows.js";
 import callRoutes from "./routes/calls.js";
 import audioRoutes from "./routes/audio.js";
+import { reconcileStaleCalls } from "./services/callHandler.js";
 
 const app = express();
 
@@ -49,6 +50,10 @@ const PORT = process.env.PORT || 4000;
 async function start() {
   await initDb();
   await bootstrapAdmin();
+  // Close out any calls left "ringing"/"connected" by a previous process
+  // lifetime (deploy, crash, restart) before accepting new traffic - see
+  // the comment on reconcileStaleCalls in services/callHandler.js.
+  await reconcileStaleCalls();
   server.listen(PORT, () => console.log(`[server] listening on :${PORT}`));
 }
 

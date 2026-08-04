@@ -1,5 +1,39 @@
 # What was fixed
 
+## 5. Calls stuck at "ringing" again after a redeploy, Answer returns 409
+
+The `sessions` Map in `callHandler.js` that holds each call's live WebRTC peer
+connection and its ring-timeout timer is **in-memory only**. Every time the
+backend process restarts — a `docker compose up --build`, a crash, anything —
+that Map is wiped, but any DB rows that were `ringing`/`connected` at that
+moment stay exactly as they were, forever, because nothing is left running to
+ever update them. Clicking "Answer" on one of those rows 409s because there's
+no session behind it to claim.
+
+Fix: added `reconcileStaleCalls()` in `callHandler.js`, run once on backend
+startup and then every 60s as a safety net. It finds any `ringing`/`connected`
+call with no matching in-memory session, best-effort tells WhatsApp to
+terminate it, and marks it `missed` in the DB — so stale rows stop showing a
+dead "Answer" button and stop lying about being an active call.
+
+**Practical implication:** don't restart/redeploy the backend while a real
+call is in progress — there's currently no way to hand a live WebRTC session
+off across a process restart, so it will always end up marked `missed`. The
+three rows you saw stuck at "ringing" were from calls that were in flight
+across earlier deploys; they'll clear to `missed` the next time the backend
+starts.
+
+## 6. TTS audio in calls — still not wired up (expected, not new)
+
+To be clear on where this stands: `playGreeting()` in `callHandler.js` calls
+the TTS service and gets an mp3 back, but it only logs the byte count — it
+does not yet transcode that into the outbound Opus/RTP track werift sends to
+WhatsApp. That's the same pre-existing gap called out in item 4 below (the
+agent audio bridge) — this is the bot-side equivalent of it, and also needs a
+live calling sandbox to build/verify against. So "no TTS heard" on a call
+right now is expected, not a regression.
+
+
 ## 1. Calls stuck on "ringing" / bot never answers (the main bug)
 
 `backend/src/services/callHandler.js` created the WebRTC peer connection like this:

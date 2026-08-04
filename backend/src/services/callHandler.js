@@ -17,6 +17,16 @@ const AGENT_RING_TIMEOUT_MS = Number(process.env.AGENT_RING_TIMEOUT_MS || 20000)
 
 // Active call sessions keyed by WhatsApp's call_id.
 // Each session: { pc, call, recording, contact, ringTimer, decided }
+//
+// IMPORTANT: this is in-memory only. If the backend process restarts (a
+// redeploy, a crash, `docker compose up --build`, nodemon/--watch reload,
+// etc.) every entry here is lost - including the werift peer connection and
+// the setTimeout that would have auto-routed the call to the bot. There is
+// no way to resume a WebRTC session after the process that held it is gone,
+// so any call left at status='ringing' or 'connected' from a *previous*
+// process lifetime is permanently stuck and must be reconciled below,
+// otherwise it sits there forever and the dashboard's "Answer" button 409s
+// on it (no session to answer).
 const sessions = new Map();
 
 // WhatsApp Calling uses Opus. werift needs the codec explicitly registered
@@ -236,6 +246,45 @@ async function failCall(waCallId, callId, err) {
     error: err?.response?.data || err?.message || String(err),
   });
 }
+
+/**
+ * Closes out any call rows left at 'ringing' or 'connected' that don't have
+ * a matching in-memory session - meaning they belong to a process lifetime
+ * that no longer exists (see the big comment on `sessions` above). Marks
+ * them 'missed' so they stop showing a live "Answer" button and stop
+ * looking like an active call that's just... never progressing.
+ *
+ * Called once on startup (covers calls orphaned by the previous deploy) and
+ * on a recurring timer (covers calls orphaned by a crash/restart that
+ * happens *while* this process is up, e.g. a `docker compose restart` you
+ * trigger mid-call).
+ */
+export async function reconcileStaleCalls() {
+  const stale = await query(
+    "SELECT id, wa_call_id, status FROM calls WHERE status IN ('ringing', 'connected')"
+  );
+  for (const row of stale.rows) {
+    if (sessions.has(row.wa_call_id)) continue; // genuinely still in progress in this process
+    try {
+      await terminateCall(row.wa_call_id);
+    } catch (_) {
+      // Call may already be gone on WhatsApp's side (it auto-times-out
+      // un-accepted calls after ~30-60s) - that's fine, we just want our
+      // own DB/UI to stop lying about it.
+    }
+    await query("UPDATE calls SET status = 'missed', ended_at = now() WHERE id = $1", [row.id]);
+    emitToDashboard("call:updated", { id: row.id, waCallId: row.wa_call_id, status: "missed" });
+  }
+  if (stale.rows.length) {
+    console.log(`[calls] reconciled ${stale.rows.length} stale call(s) orphaned by a previous process`);
+  }
+}
+
+// Re-run the sweep periodically too, in case this process itself loses a
+// session mid-flight for a reason other than a full restart.
+setInterval(() => {
+  reconcileStaleCalls().catch((err) => console.error("[calls] stale-call sweep failed", err));
+}, 60000);
 
 // Speaks text into an active call via the self-hosted TTS service.
 // See docstring above: verify this against your werift version's outbound
