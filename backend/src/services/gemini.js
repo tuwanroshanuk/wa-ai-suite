@@ -1,8 +1,23 @@
 import axios from "axios";
 
 const API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
-const AUDIO_MODEL = process.env.GEMINI_AUDIO_MODEL || MODEL;
+
+function supportedEnvironmentModel(value, fallback) {
+  const model = String(value || "").trim();
+  // Gemini 2.0 endpoints were shut down. Preserve existing Dokploy .env files
+  // without letting an obsolete model name disable messages or fallback calls.
+  if (!model || model.startsWith("gemini-2.0")) return fallback;
+  return model;
+}
+
+const MODEL = supportedEnvironmentModel(
+  process.env.GEMINI_MODEL,
+  "gemini-3.5-flash-lite"
+);
+const AUDIO_MODEL = supportedEnvironmentModel(
+  process.env.GEMINI_AUDIO_MODEL,
+  MODEL
+);
 const STT_URL = process.env.STT_SERVICE_URL || "http://stt-service:7000";
 const STT_PROVIDER = String(process.env.STT_PROVIDER || "local").trim().toLowerCase();
 
@@ -18,7 +33,7 @@ function extractText(data, fallback = "") {
 
 export async function generateReply(history, systemPrompt, options = {}) {
   assertGeminiConfigured();
-  const model = String(options.model || MODEL).trim();
+  const model = supportedEnvironmentModel(options.model, MODEL);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`;
 
   const contents = history.map((item) => ({
