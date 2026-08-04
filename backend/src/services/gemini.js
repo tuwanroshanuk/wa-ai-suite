@@ -16,9 +16,10 @@ function extractText(data, fallback = "") {
   ).trim();
 }
 
-export async function generateReply(history, systemPrompt) {
+export async function generateReply(history, systemPrompt, options = {}) {
   assertGeminiConfigured();
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
+  const model = String(options.model || MODEL).trim();
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`;
 
   const contents = history.map((item) => ({
     role: item.role === "assistant" ? "model" : "user",
@@ -30,14 +31,12 @@ export async function generateReply(history, systemPrompt) {
     ...(systemPrompt
       ? { systemInstruction: { role: "system", parts: [{ text: systemPrompt }] } }
       : {}),
-    // Current Gemini 3.x models no longer require the deprecated sampling
-    // parameters used by the old 2.0 endpoint.
-    generationConfig: { maxOutputTokens: 300 },
+    generationConfig: { maxOutputTokens: Number(options.maxOutputTokens || 300) },
   };
 
   const { data } = await axios.post(url, body, {
     headers: { "Content-Type": "application/json" },
-    timeout: 30000,
+    timeout: Number(options.timeoutMs || 30000),
   });
 
   return extractText(data, "Sorry, I couldn't come up with a response.");
@@ -105,7 +104,5 @@ export async function transcribeAudio(audioBuffer, mimeType = "audio/wav") {
     }
   }
 
-  // Local is the production default. It has no request quota and prevents a
-  // Gemini billing/rate-limit problem from disabling live call transcripts.
   return transcribeLocally(audioBuffer, mimeType);
 }
