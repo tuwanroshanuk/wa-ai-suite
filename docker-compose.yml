@@ -1,0 +1,61 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-wa_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wa_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-wa_suite}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+
+  tts-service:
+    build: ./tts-service
+    restart: unless-stopped
+    environment:
+      - PORT=6000
+    ports:
+      - "6000:6000"
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - redis
+      - tts-service
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgres://${POSTGRES_USER:-wa_user}:${POSTGRES_PASSWORD:-wa_pass}@postgres:5432/${POSTGRES_DB:-wa_suite}
+      - REDIS_URL=redis://redis:6379
+      - TTS_SERVICE_URL=http://tts-service:6000
+    volumes:
+      - recordings:/app/recordings
+    ports:
+      - "4000:4000"
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=${PUBLIC_API_URL:-http://localhost:4000}
+    ports:
+      - "3000:80"
+
+volumes:
+  pgdata:
+  redisdata:
+  recordings:
