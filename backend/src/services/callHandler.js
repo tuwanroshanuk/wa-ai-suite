@@ -17,7 +17,9 @@ const RECORDINGS_DIR = process.env.RECORDINGS_DIR || "/app/recordings";
 if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
 const AGENT_RING_TIMEOUT_MS = Number(process.env.AGENT_RING_TIMEOUT_MS || 15000);
-const ICE_GATHER_TIMEOUT_MS = Number(process.env.ICE_GATHER_TIMEOUT_MS || 8000);
+const ICE_MIN_PORT = Number(process.env.WEBRTC_ICE_MIN_PORT || 50000);
+const ICE_MAX_PORT = Number(process.env.WEBRTC_ICE_MAX_PORT || 50010);
+const FAST_ICE_WAIT_MS = Number(process.env.WEBRTC_FAST_ICE_WAIT_MS || 200);
 const sessions = new Map();
 
 function makePeerConnection() {
@@ -25,8 +27,11 @@ function makePeerConnection() {
     ? [{ urls: process.env.WEBRTC_STUN_URL }]
     : [{ urls: "stun:stun.l.google.com:19302" }];
 
-  return new RTCPeerConnection({
+  const config = {
     iceServers,
+    icePortRange: [ICE_MIN_PORT, ICE_MAX_PORT],
+    iceUseIpv4: true,
+    iceUseIpv6: false,
     codecs: {
       audio: [
         new RTCRtpCodecParameters({
@@ -38,19 +43,26 @@ function makePeerConnection() {
         }),
       ],
     },
-  });
+  };
+
+  // On a Docker host the public address is not a local interface. Werift can
+  // still advertise it as an additional host candidate while binding UDP on
+  // the container interface. Set this to the VPS public IPv4 in Dokploy.
+  if (process.env.WEBRTC_PUBLIC_IP) {
+    config.iceAdditionalHostAddresses = [process.env.WEBRTC_PUBLIC_IP];
+  }
+
+  return new RTCPeerConnection(config);
 }
 
-async function waitForIceGatheringComplete(pc) {
+async function shortIceWait(pc) {
   if (pc.iceGatheringState === "complete") return;
   await new Promise((resolve) => {
     let subscription;
     const timer = setTimeout(() => {
       subscription?.unSubscribe?.();
-      console.warn("[call] ICE gathering timed out; sending current SDP candidates");
       resolve();
-    }, ICE_GATHER_TIMEOUT_MS);
-
+    }, FAST_ICE_WAIT_MS);
     subscription = pc.iceGatheringStateChange.subscribe((state) => {
       if (state !== "complete") return;
       clearTimeout(timer);
@@ -61,18 +73,18 @@ async function waitForIceGatheringComplete(pc) {
 }
 
 async function waitForConnected(pc, timeoutMs = 5000) {
-  if (pc.connectionState === "connected") return;
-  await new Promise((resolve) => {
+  if (pc.connectionState === "connected") return true;
+  return new Promise((resolve) => {
     let subscription;
     const timer = setTimeout(() => {
       subscription?.unSubscribe?.();
-      resolve();
+      resolve(false);
     }, timeoutMs);
     subscription = pc.connectionStateChange.subscribe((state) => {
       if (state !== "connected") return;
       clearTimeout(timer);
       subscription?.unSubscribe?.();
-      resolve();
+      resolve(true);
     });
   });
 }
@@ -82,7 +94,7 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
 
   const inserted = await query(
     `INSERT INTO calls (contact_id, wa_call_id, direction, handled_by, status, consent_status)
-     VALUES ($1, $2, 'inbound', 'unassigned', 'ringing', 'not_required')
+     VALUES ($1,$2,'inbound','unassigned','ringing','not_required')
      ON CONFLICT (wa_call_id) DO NOTHING
      RETURNING *`,
     [contact.id, waCallId]
@@ -90,7 +102,7 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
 
   let call = inserted.rows[0];
   if (!call) {
-    const existing = await query("SELECT * FROM calls WHERE wa_call_id = $1", [waCallId]);
+    const existing = await query("SELECT * FROM calls WHERE wa_call_id=$1", [waCallId]);
     call = existing.rows[0];
     if (!call || call.status !== "ringing") return call;
   }
@@ -98,6 +110,7 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
   let pc;
   let recording;
   try {
+    console.log(`[call ${waCallId}] preparing WebRTC answer`);
     pc = makePeerConnection();
     const outboundTrack = new MediaStreamTrack({ kind: "audio" });
     pc.addTransceiver(outboundTrack, { direction: "sendrecv" });
@@ -110,15 +123,16 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
 
     pc.connectionStateChange.subscribe((state) => {
       console.log(`[call ${waCallId}] WebRTC state: ${state}`);
-      if (state === "failed") {
-        failCall(waCallId, call.id, new Error("WebRTC connection failed")).catch(console.error);
-      }
     });
 
     await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
     await pc.setLocalDescription(await pc.createAnswer());
-    await waitForIceGatheringComplete(pc);
 
+    // Meta is terminating these calls around 1–2 seconds after CONNECT. The
+    // old code waited up to 8 seconds for ICE before pre_accept, so Meta never
+    // received a response in time. Give gathering only a tiny head start and
+    // pre_accept immediately with the current SDP.
+    await shortIceWait(pc);
     if (!pc.localDescription?.sdp) throw new Error("WebRTC answer SDP was not generated");
 
     const session = {
@@ -132,8 +146,9 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
     };
     sessions.set(waCallId, session);
 
-    console.log(`[call ${waCallId}] sending pre_accept with gathered ICE candidates`);
+    console.log(`[call ${waCallId}] sending pre_accept immediately`);
     await preAcceptCall(waCallId, pc.localDescription.sdp);
+    console.log(`[call ${waCallId}] pre_accept completed`);
 
     if (getOnlineAgentCount() > 0) {
       emitToDashboard("call:incoming", {
@@ -142,22 +157,25 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
         contact: { id: contact.id, name: contact.name, wa_id: contact.wa_id },
         startedAt: call.started_at,
       });
+      console.log(`[call ${waCallId}] incoming-call popup emitted to dashboard`);
       session.ringTimer = setTimeout(() => {
         answerWithBot(waCallId).catch((err) =>
-          console.error(`[call ${waCallId}] auto-answer-with-bot failed`, err)
+          console.error(`[call ${waCallId}] automatic AI answer failed`, err)
         );
       }, AGENT_RING_TIMEOUT_MS);
     } else {
-      console.log(`[call ${waCallId}] no dashboard agent online; routing directly to AI bot`);
+      console.log(`[call ${waCallId}] no agent online; accepting with AI immediately`);
       setImmediate(() => answerWithBot(waCallId));
     }
 
     return call;
   } catch (err) {
-    console.error(
-      `[call ${waCallId}] setup failed`,
-      err.response?.data || err.stack || err.message || err
-    );
+    console.error(`[call ${waCallId}] setup failed`, {
+      status: err.response?.status,
+      data: err.response?.data,
+      message: err.message,
+      stack: err.stack,
+    });
     if (recording) recording.stop();
     try { pc?.close(); } catch (_) {}
     await failCall(waCallId, call.id, err);
@@ -167,19 +185,16 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
 
 export async function claimCallAsAgent(waCallId, user) {
   const session = sessions.get(waCallId);
-  if (!session || session.decided) {
-    throw new Error("Call is no longer available to answer.");
-  }
+  if (!session || session.decided) throw new Error("Call is no longer available.");
 
   session.decided = true;
   clearTimeout(session.ringTimer);
-
   try {
-    await acceptCall(waCallId, session.pc.localDescription.sdp);
-    await waitForConnected(session.pc);
+    await acceptCall(waCallId);
+    const connected = await waitForConnected(session.pc);
     const handledBy = `agent:${user.id}`;
     const result = await query(
-      "UPDATE calls SET status='connected', handled_by=$1 WHERE id=$2 RETURNING *",
+      "UPDATE calls SET status='connected',handled_by=$1 WHERE id=$2 RETURNING *",
       [handledBy, session.call.id]
     );
     emitToDashboard("call:updated", {
@@ -187,6 +202,7 @@ export async function claimCallAsAgent(waCallId, user) {
       waCallId,
       status: "connected",
       handled_by: handledBy,
+      media_connected: connected,
     });
     return result.rows[0] || session.call;
   } catch (err) {
@@ -201,11 +217,10 @@ export async function answerWithBot(waCallId) {
 
   session.decided = true;
   clearTimeout(session.ringTimer);
-
   try {
-    console.log(`[call ${waCallId}] accepting call for AI bot`);
-    await acceptCall(waCallId, session.pc.localDescription.sdp);
-    await query("UPDATE calls SET status='connected', handled_by='bot' WHERE id=$1", [
+    console.log(`[call ${waCallId}] sending final accept for AI bot`);
+    await acceptCall(waCallId);
+    await query("UPDATE calls SET status='connected',handled_by='bot' WHERE id=$1", [
       session.call.id,
     ]);
     emitToDashboard("call:updated", {
@@ -215,17 +230,19 @@ export async function answerWithBot(waCallId) {
       handled_by: "bot",
     });
 
-    await waitForConnected(session.pc);
+    const connected = await waitForConnected(session.pc);
+    console.log(`[call ${waCallId}] media connected=${connected}`);
     await playGreeting(
       waCallId,
       process.env.CALL_GREETING ||
         "Hi! Thanks for calling. This is our AI assistant. How can I help?"
     );
   } catch (err) {
-    console.error(
-      `[call ${waCallId}] bot answer failed`,
-      err.response?.data || err.stack || err.message || err
-    );
+    console.error(`[call ${waCallId}] bot answer failed`, {
+      status: err.response?.status,
+      data: err.response?.data,
+      message: err.message,
+    });
     await failCall(waCallId, session.call.id, err);
   }
 }
@@ -240,10 +257,7 @@ export async function handleCallTerminated(waCallId, outcome = "terminate") {
     try { session.pc.close(); } catch (_) {}
   }
 
-  const existing = await query(
-    "SELECT id,status FROM calls WHERE wa_call_id=$1",
-    [waCallId]
-  );
+  const existing = await query("SELECT id,status FROM calls WHERE wa_call_id=$1", [waCallId]);
   const row = existing.rows[0];
   sessions.delete(waCallId);
   if (!row) return;
@@ -254,7 +268,7 @@ export async function handleCallTerminated(waCallId, outcome = "terminate") {
   else if (row.status === "failed") finalStatus = "failed";
 
   const result = await query(
-    `UPDATE calls SET status=$1, ended_at=COALESCE(ended_at,now()),
+    `UPDATE calls SET status=$1,ended_at=COALESCE(ended_at,now()),
        recording_path=COALESCE($2,recording_path)
      WHERE wa_call_id=$3 RETURNING id,status`,
     [finalStatus, recordingPath, waCallId]
@@ -324,10 +338,7 @@ export async function reconcileStaleCalls() {
     if (sessions.has(row.wa_call_id)) continue;
     try { await terminateCall(row.wa_call_id); } catch (_) {}
     const status = row.status === "connected" ? "ended" : "missed";
-    await query("UPDATE calls SET status=$1,ended_at=COALESCE(ended_at,now()) WHERE id=$2", [
-      status,
-      row.id,
-    ]);
+    await query("UPDATE calls SET status=$1,ended_at=COALESCE(ended_at,now()) WHERE id=$2", [status, row.id]);
     emitToDashboard("call:updated", { id: row.id, waCallId: row.wa_call_id, status });
   }
 }
@@ -343,7 +354,6 @@ async function playGreeting(waCallId, text) {
   const mp3 = await synthesize(text);
   const udp = dgram.createSocket("udp4");
   const port = 30000 + Math.floor(Math.random() * 9000);
-
   await new Promise((resolve, reject) => {
     udp.once("error", reject);
     udp.bind(port, "127.0.0.1", resolve);
@@ -360,26 +370,15 @@ async function playGreeting(waCallId, text) {
   });
 
   const ffmpeg = spawn("ffmpeg", [
-    "-hide_banner",
-    "-loglevel", "error",
-    "-re",
-    "-i", "pipe:0",
-    "-vn",
-    "-acodec", "libopus",
-    "-ar", "48000",
-    "-ac", "2",
-    "-application", "voip",
-    "-frame_duration", "20",
-    "-payload_type", "111",
-    "-f", "rtp",
-    `rtp://127.0.0.1:${port}`,
+    "-hide_banner", "-loglevel", "error", "-re", "-i", "pipe:0",
+    "-vn", "-acodec", "libopus", "-ar", "48000", "-ac", "2",
+    "-application", "voip", "-frame_duration", "20", "-payload_type", "111",
+    "-f", "rtp", `rtp://127.0.0.1:${port}`,
   ]);
-
   ffmpeg.stdin.end(mp3);
   ffmpeg.stderr.on("data", (data) =>
     console.error(`[call ${waCallId}] ffmpeg TTS: ${data.toString().trim()}`)
   );
-
   await new Promise((resolve) => {
     ffmpeg.once("close", resolve);
     ffmpeg.once("error", resolve);
@@ -393,27 +392,18 @@ function startRecording(waCallId) {
   const socket = dgram.createSocket("udp4");
   const outputPath = path.join(RECORDINGS_DIR, `${waCallId}.wav`);
   const sdpPath = path.join(RECORDINGS_DIR, `${waCallId}.sdp`);
-
   fs.writeFileSync(
     sdpPath,
     [
-      "v=0",
-      "o=- 0 0 IN IP4 127.0.0.1",
-      "s=recording",
-      "c=IN IP4 127.0.0.1",
-      "t=0 0",
-      `m=audio ${udpPort} RTP/AVP 111`,
+      "v=0", "o=- 0 0 IN IP4 127.0.0.1", "s=recording",
+      "c=IN IP4 127.0.0.1", "t=0 0", `m=audio ${udpPort} RTP/AVP 111`,
       "a=rtpmap:111 opus/48000/2",
     ].join("\n")
   );
-
   const ffmpeg = spawn("ffmpeg", [
-    "-protocol_whitelist", "file,udp,rtp",
-    "-i", sdpPath,
-    "-y", outputPath,
+    "-protocol_whitelist", "file,udp,rtp", "-i", sdpPath, "-y", outputPath,
   ]);
   ffmpeg.stderr.on("data", () => {});
-
   return {
     outputPath,
     feed(rtp) {
