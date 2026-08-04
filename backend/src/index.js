@@ -15,20 +15,18 @@ import flowRoutes from "./routes/flows.js";
 import callRoutes from "./routes/calls.js";
 import audioRoutes from "./routes/audio.js";
 import voiceSettingsRoutes from "./routes/voiceSettings.js";
+import aiAgentRoutes from "./routes/aiAgent.js";
 import { reconcileStaleCalls } from "./services/callHandler.js";
 
 const app = express();
 const corsOptions = expressCorsOptions();
 
-// Apply CORS before auth and every API route so browser preflight requests
-// from the dashboard are answered without requiring a JWT.
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 
-// Capture the raw body for webhook signature verification, while still
-// parsing JSON everywhere else.
 app.use(
   express.json({
+    limit: "2mb",
     verify: (req, res, buf) => {
       req.rawBody = buf;
     },
@@ -37,17 +35,16 @@ app.use(
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-// Public
 app.use("/auth", authRoutes);
-app.use("/webhook", webhookRoutes); // Meta calls this directly, no JWT
+app.use("/webhook", webhookRoutes);
 
-// Authenticated dashboard API
 app.use("/api/conversations", requireAuth, conversationRoutes);
 app.use("/api/contacts", requireAuth, contactRoutes);
 app.use("/api/flows", requireAuth, flowRoutes);
 app.use("/api/calls", requireAuth, callRoutes);
 app.use("/api/audio", requireAuth, audioRoutes);
 app.use("/api/voice-settings", requireAuth, voiceSettingsRoutes);
+app.use("/api/ai-agent", requireAuth, aiAgentRoutes);
 
 const server = http.createServer(app);
 initSockets(server);
