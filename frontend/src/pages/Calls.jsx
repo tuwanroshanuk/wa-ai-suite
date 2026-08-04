@@ -1,9 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, API_URL } from "../api";
+import { getSocket } from "../socket";
 
 export default function Calls() {
   const [calls, setCalls] = useState([]);
   const [waId, setWaId] = useState("");
+  const [requestError, setRequestError] = useState("");
+  const [requesting, setRequesting] = useState(false);
+  // callId -> ms remaining before it auto-routes to the bot
+  const [ringing, setRinging] = useState({});
+  const tickRef = useRef(null);
 
   function load() {
     api.get("/api/calls").then((r) => setCalls(r.data));
@@ -11,14 +17,77 @@ export default function Calls() {
 
   useEffect(() => {
     load();
-    const i = setInterval(load, 5000);
-    return () => clearInterval(i);
+    // Live updates come over the socket now; keep a slow poll as a fallback
+    // in case a socket event is ever missed.
+    const i = setInterval(load, 15000);
+
+    const socket = getSocket();
+
+    function onIncoming(payload) {
+      setRinging((prev) => ({
+        ...prev,
+        [payload.id]: { ...payload, deadline: Date.now() + payload.ringTimeoutMs },
+      }));
+      load();
+    }
+
+    function onUpdated(payload) {
+      setRinging((prev) => {
+        if (!(payload.id in prev)) return prev;
+        const next = { ...prev };
+        delete next[payload.id];
+        return next;
+      });
+      load();
+    }
+
+    socket.on("call:incoming", onIncoming);
+    socket.on("call:updated", onUpdated);
+
+    return () => {
+      clearInterval(i);
+      socket.off("call:incoming", onIncoming);
+      socket.off("call:updated", onUpdated);
+    };
+  }, []);
+
+  // Re-render every second so the countdown on ringing calls ticks down.
+  useEffect(() => {
+    tickRef.current = setInterval(() => setRinging((r) => ({ ...r })), 1000);
+    return () => clearInterval(tickRef.current);
   }, []);
 
   async function requestPermission() {
     if (!waId) return;
-    await api.post("/api/calls/request-permission", { waId });
-    alert("Permission request sent to customer via WhatsApp template.");
+    setRequestError("");
+    setRequesting(true);
+    try {
+      await api.post("/api/calls/request-permission", { waId });
+      alert("Permission request sent to customer via WhatsApp template.");
+      setWaId("");
+    } catch (err) {
+      setRequestError(
+        err.response?.data?.error?.toString() ||
+          err.message ||
+          "Failed to send permission request."
+      );
+    } finally {
+      setRequesting(false);
+    }
+  }
+
+  async function answerCall(callId) {
+    try {
+      await api.post(`/api/calls/${callId}/answer`, {});
+      setRinging((prev) => {
+        const next = { ...prev };
+        delete next[callId];
+        return next;
+      });
+      load();
+    } catch (err) {
+      alert(err.response?.data?.error || err.message || "Could not answer the call.");
+    }
   }
 
   async function takeOver(call) {
@@ -28,9 +97,32 @@ export default function Calls() {
     );
   }
 
+  const ringingList = Object.values(ringing);
+
   return (
     <div>
       <h1>Calls</h1>
+
+      {ringingList.map((r) => {
+        const secondsLeft = Math.max(0, Math.ceil((r.deadline - Date.now()) / 1000));
+        return (
+          <div
+            key={r.id}
+            className="card"
+            style={{ borderLeft: "4px solid #25d366", display: "flex", alignItems: "center", justifyContent: "space-between" }}
+          >
+            <div>
+              <strong>Incoming call</strong> from {r.contact?.name || r.contact?.wa_id}
+              <div style={{ fontSize: 13, color: "#666" }}>
+                Routes to the AI bot in {secondsLeft}s if no one answers.
+              </div>
+            </div>
+            <button className="primary" onClick={() => answerCall(r.id)}>
+              Answer
+            </button>
+          </div>
+        );
+      })}
 
       <div className="card">
         <h3>Request outbound call permission</h3>
@@ -44,8 +136,13 @@ export default function Calls() {
             value={waId}
             onChange={(e) => setWaId(e.target.value)}
           />
-          <button className="primary" onClick={requestPermission}>Request</button>
+          <button className="primary" onClick={requestPermission} disabled={requesting}>
+            {requesting ? "Sending..." : "Request"}
+          </button>
         </div>
+        {requestError && (
+          <p style={{ color: "#b91c1c", fontSize: 13, marginTop: -4 }}>{requestError}</p>
+        )}
       </div>
 
       <div className="card">
@@ -71,6 +168,9 @@ export default function Calls() {
                   )}
                 </td>
                 <td>
+                  {c.status === "ringing" && (
+                    <button className="primary" onClick={() => answerCall(c.id)}>Answer</button>
+                  )}
                   {c.status === "connected" && (
                     <button className="secondary" onClick={() => takeOver(c)}>Take over (browser)</button>
                   )}

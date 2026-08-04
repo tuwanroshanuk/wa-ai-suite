@@ -4,7 +4,24 @@ const GRAPH_VERSION = process.env.GRAPH_API_VERSION || "v21.0";
 const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
 
-const base = () => `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_NUMBER_ID}`;
+// Fail fast with a clear message instead of letting axios throw a confusing
+// "Request failed with status code 500"-style error further down the stack -
+// this is the most common cause of the dashboard's "request-permission" 500.
+function assertConfigured() {
+  const missing = [];
+  if (!PHONE_NUMBER_ID) missing.push("WHATSAPP_PHONE_NUMBER_ID");
+  if (!ACCESS_TOKEN) missing.push("WHATSAPP_ACCESS_TOKEN");
+  if (missing.length) {
+    throw new Error(
+      `WhatsApp API is not configured: missing ${missing.join(", ")}. Set these in your .env (see .env.example) and restart the backend.`
+    );
+  }
+}
+
+const base = () => {
+  assertConfigured();
+  return `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_NUMBER_ID}`;
+};
 const headers = () => ({
   Authorization: `Bearer ${ACCESS_TOKEN}`,
   "Content-Type": "application/json",

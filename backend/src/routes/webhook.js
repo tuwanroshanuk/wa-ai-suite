@@ -2,12 +2,12 @@ import { Router } from "express";
 import crypto from "crypto";
 import { query } from "../db/index.js";
 import { advanceFlow } from "../services/flowEngine.js";
-import { requestCallPermission } from "../services/whatsapp.js";
 import {
   handleIncomingCall,
   handleCallTerminated,
   rejectIncomingCall,
 } from "../services/callHandler.js";
+import { emitToDashboard } from "../sockets.js";
 
 const router = Router();
 
@@ -109,7 +109,12 @@ async function handleInboundMessage(value, msg) {
   );
   await query("UPDATE conversations SET last_message_at = now() WHERE id = $1", [conversation.id]);
 
-  // TODO: emit socket.io event here so the dashboard updates live (see src/sockets.js)
+  emitToDashboard("message:new", {
+    conversationId: conversation.id,
+    contactId: contact.id,
+    text,
+    type: msg.type,
+  });
 
   if (contact.bot_enabled && conversation.status === "open") {
     await advanceFlow(conversation, contact, text);
@@ -138,16 +143,9 @@ async function handleCallEvent(value, call) {
   }
 }
 
-// Convenience endpoint the dashboard can call to request outbound-call
-// consent from a customer before the bot/agent tries to call them.
-router.post("/request-call-permission", async (req, res) => {
-  const { waId, templateName } = req.body;
-  try {
-    await requestCallPermission(waId, templateName);
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.response?.data || err.message });
-  }
-});
+// NOTE: outbound call-permission requests are handled by the authenticated
+// POST /api/calls/request-permission route (see routes/calls.js). A second,
+// unauthenticated copy used to live here (mounted under public /webhook) -
+// removed since it let anyone trigger WhatsApp template sends without login.
 
 export default router;

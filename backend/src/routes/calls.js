@@ -3,6 +3,7 @@ import path from "path";
 import fs from "fs";
 import { query } from "../db/index.js";
 import { requestCallPermission } from "../services/whatsapp.js";
+import { claimCallAsAgent } from "../services/callHandler.js";
 
 const router = Router();
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || "/app/recordings";
@@ -27,11 +28,35 @@ router.get("/:id/recording", async (req, res) => {
 // via WhatsApp's required interactive call-permission template.
 router.post("/request-permission", async (req, res) => {
   const { waId, templateName } = req.body;
+  if (!waId) return res.status(400).json({ error: "waId is required" });
   try {
     await requestCallPermission(waId, templateName);
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.response?.data || err.message });
+    // Surface Meta's actual error (bad template name, unconfigured
+    // credentials, unverified number, etc.) instead of a bare 500 so the
+    // dashboard can show the person what actually went wrong.
+    const detail = err.response?.data?.error?.message || err.response?.data || err.message;
+    res.status(err.response?.status || 500).json({ error: detail });
+  }
+});
+
+/**
+ * An agent claims a still-ringing incoming call before the auto-answer
+ * timeout routes it to the bot (see services/callHandler.js).
+ */
+router.post("/:id/answer", async (req, res) => {
+  const result = await query("SELECT wa_call_id, status FROM calls WHERE id = $1", [req.params.id]);
+  const row = result.rows[0];
+  if (!row) return res.status(404).json({ error: "Call not found" });
+  if (row.status !== "ringing") {
+    return res.status(409).json({ error: `Call is no longer ringing (status: ${row.status})` });
+  }
+  try {
+    await claimCallAsAgent(row.wa_call_id, req.user);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(409).json({ error: err.message });
   }
 });
 

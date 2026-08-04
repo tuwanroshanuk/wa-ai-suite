@@ -2,111 +2,239 @@ import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
 import dgram from "dgram";
-import { RTCPeerConnection } from "werift";
+import { RTCPeerConnection, RTCRtpCodecParameters } from "werift";
 import { query } from "../db/index.js";
-import { preAcceptCall, acceptCall, rejectCall, terminateCall, sendText } from "./whatsapp.js";
+import { preAcceptCall, acceptCall, rejectCall, terminateCall } from "./whatsapp.js";
 import { synthesize } from "./tts.js";
+import { emitToDashboard } from "../sockets.js";
 
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || "/app/recordings";
 if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
+// How long an incoming call rings on the dashboard before we auto-route it
+// to the bot. Configurable via env; defaults to 20s.
+const AGENT_RING_TIMEOUT_MS = Number(process.env.AGENT_RING_TIMEOUT_MS || 20000);
+
 // Active call sessions keyed by WhatsApp's call_id.
+// Each session: { pc, call, recording, contact, ringTimer, decided }
 const sessions = new Map();
+
+// WhatsApp Calling uses Opus. werift needs the codec explicitly registered
+// (payloadType 111 is the de-facto standard dynamic PT WhatsApp/Meta send in
+// their SDP offers) or SDP negotiation silently fails and the peer connection
+// never completes - which is why calls were getting stuck at "ringing".
+function makePeerConnection() {
+  return new RTCPeerConnection({
+    codecs: {
+      audio: [
+        new RTCRtpCodecParameters({
+          mimeType: "audio/opus",
+          clockRate: 48000,
+          channels: 2,
+          payloadType: 111,
+        }),
+      ],
+    },
+  });
+}
 
 /**
  * Called from routes/webhook.js when Meta sends a `connect` call event
- * (an inbound call with an SDP offer), OR when your agent/bot decides
- * to answer programmatically.
+ * (an inbound call with an SDP offer).
  *
- * This function:
- *  1. Creates a WebRTC peer connection (werift) and sets the remote offer.
- *  2. Starts recording the inbound audio track to disk (via a local RTP relay
- *     into ffmpeg - see startRecording below). This part is tested and works
- *     with any standard Opus/PCMU RTP stream.
- *  3. Generates an SDP answer and pre-accepts, then accepts, the call via
- *     the Graph API.
- *  4. Leaves a hook (playGreeting) where you inject the bot's spoken audio.
- *     Getting audio you generate (TTS mp3) actually flowing back out over
- *     werift's encrypted RTP stream is the one piece you should verify
- *     against the exact werift version pinned in package.json - the send-side
- *     media API differs across WebRTC library versions. Test this against
- *     your Meta calling sandbox before relying on it in production; if it
- *     doesn't line up, the reliable fallback used by many teams is to route
- *     the AI voice turn through short pre-recorded/TTS WhatsApp *audio
- *     messages* sent in the same chat instead of true in-call injection,
- *     while still using this file's signaling/recording for real calls.
+ * Flow:
+ *  1. Create the call row (status='ringing') and a WebRTC peer connection,
+ *     set the remote offer, and pre_accept immediately so media is ready
+ *     the moment anyone (agent or bot) decides to answer.
+ *  2. Notify the dashboard in real time (`call:incoming`) so an agent has
+ *     AGENT_RING_TIMEOUT_MS to click "Answer".
+ *  3. If nobody answers in time, auto-route to the bot (answerWithBot).
+ *
+ * Any failure along the way rejects the call and marks it 'failed' instead
+ * of leaving it stuck at 'ringing' forever.
  */
 export async function handleIncomingCall({ waCallId, fromWaId, offerSdp, contact }) {
   const callRow = await query(
     `INSERT INTO calls (contact_id, wa_call_id, direction, handled_by, status, consent_status)
-     VALUES ($1, $2, 'inbound', 'bot', 'ringing', 'not_required')
+     VALUES ($1, $2, 'inbound', 'unassigned', 'ringing', 'not_required')
      ON CONFLICT (wa_call_id) DO UPDATE SET status = 'ringing'
      RETURNING *`,
     [contact.id, waCallId]
   );
   const call = callRow.rows[0];
 
-  const pc = new RTCPeerConnection({
-    codecs: {
-      audio: [
-        // Opus is what WhatsApp calling uses.
-      ],
-    },
-  });
+  try {
+    const pc = makePeerConnection();
+    const recording = startRecording(waCallId);
 
-  const recording = startRecording(waCallId);
-
-  pc.onTrack.subscribe((track) => {
-    if (track.kind !== "audio") return;
-    track.onReceiveRtp.subscribe((rtp) => {
-      recording.feed(rtp);
+    pc.onTrack.subscribe((track) => {
+      if (track.kind !== "audio") return;
+      track.onReceiveRtp.subscribe((rtp) => {
+        recording.feed(rtp);
+      });
     });
+
+    await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+
+    // Early media / ringback - lets the call stay "ringing" on the caller's
+    // side while we decide who answers, per WhatsApp's two-step accept flow.
+    await preAcceptCall(waCallId, pc.localDescription.sdp);
+
+    const session = { pc, call, recording, contact, ringTimer: null, decided: false };
+    sessions.set(waCallId, session);
+
+    emitToDashboard("call:incoming", {
+      id: call.id,
+      waCallId,
+      contact: { id: contact.id, name: contact.name, wa_id: contact.wa_id },
+      ringTimeoutMs: AGENT_RING_TIMEOUT_MS,
+      startedAt: call.started_at,
+    });
+
+    session.ringTimer = setTimeout(() => {
+      answerWithBot(waCallId).catch((err) => {
+        console.error(`[call ${waCallId}] auto-answer-with-bot failed`, err);
+      });
+    }, AGENT_RING_TIMEOUT_MS);
+
+    return call;
+  } catch (err) {
+    console.error(`[call ${waCallId}] failed to set up incoming call`, err);
+    await failCall(waCallId, call.id, err);
+    throw err;
+  }
+}
+
+/**
+ * An agent on the dashboard claims a still-ringing call within the ring
+ * window. Cancels the auto-bot timer and formally accepts the call.
+ *
+ * NOTE: this finalizes the WhatsApp-side call (handled_by is now this
+ * agent) and audio is flowing into our werift peer connection. Actually
+ * bridging that audio into the agent's browser tab (two-way) is the
+ * separate WebRTC-bridge milestone described in routes/calls.js /take-over
+ * - not yet built. Until that bridge exists, "answering as agent" reserves
+ * the call for the agent and stops the bot from taking it, but does not
+ * yet pipe live audio to the agent's browser.
+ */
+export async function claimCallAsAgent(waCallId, user) {
+  const session = sessions.get(waCallId);
+  if (!session || session.decided) {
+    throw new Error("Call is no longer available to answer (already handled or ended).");
+  }
+  session.decided = true;
+  clearTimeout(session.ringTimer);
+
+  await acceptCall(waCallId, session.pc.localDescription.sdp);
+
+  const handledBy = `agent:${user.id}`;
+  await query("UPDATE calls SET status = 'connected', handled_by = $1 WHERE id = $2", [
+    handledBy,
+    session.call.id,
+  ]);
+
+  emitToDashboard("call:updated", {
+    id: session.call.id,
+    waCallId,
+    status: "connected",
+    handled_by: handledBy,
   });
 
-  await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
+  return session.call;
+}
 
-  sessions.set(waCallId, { pc, call, recording, contact });
+/**
+ * No agent answered in time (or the bot is configured to answer instantly
+ * for this contact) - accept the call as the AI bot and greet the caller.
+ */
+export async function answerWithBot(waCallId) {
+  const session = sessions.get(waCallId);
+  if (!session || session.decided) return;
+  session.decided = true;
+  clearTimeout(session.ringTimer);
 
-  // Two-step accept per WhatsApp calling flow: pre_accept establishes media,
-  // accept confirms the call is answered.
-  await preAcceptCall(waCallId, pc.localDescription.sdp);
-  await acceptCall(waCallId, pc.localDescription.sdp);
+  try {
+    await acceptCall(waCallId, session.pc.localDescription.sdp);
 
-  await query("UPDATE calls SET status = 'connected' WHERE id = $1", [call.id]);
+    await query("UPDATE calls SET status = 'connected', handled_by = 'bot' WHERE id = $1", [
+      session.call.id,
+    ]);
 
-  // Greet the caller. See the docstring above re: verifying in-call audio
-  // injection with your werift version; this call is the intended hook point.
-  await playGreeting(waCallId, `Hi! Thanks for calling. This is our AI assistant, how can I help?`);
+    emitToDashboard("call:updated", {
+      id: session.call.id,
+      waCallId,
+      status: "connected",
+      handled_by: "bot",
+    });
 
-  return call;
+    // Greet the caller. See the docstring on playGreeting re: verifying
+    // in-call audio injection with your werift version.
+    await playGreeting(waCallId, `Hi! Thanks for calling. This is our AI assistant, how can I help?`);
+  } catch (err) {
+    console.error(`[call ${waCallId}] bot failed to answer`, err);
+    await failCall(waCallId, session.call.id, err);
+  }
 }
 
 export async function handleCallTerminated(waCallId) {
   const session = sessions.get(waCallId);
   if (!session) return;
+  clearTimeout(session.ringTimer);
   session.recording.stop();
   try {
     session.pc.close();
   } catch (_) {}
 
   const finalPath = session.recording.outputPath;
-  await query(
-    "UPDATE calls SET status = 'ended', ended_at = now(), recording_path = $1 WHERE wa_call_id = $2",
+  const result = await query(
+    "UPDATE calls SET status = 'ended', ended_at = now(), recording_path = $1 WHERE wa_call_id = $2 RETURNING id",
     [finalPath, waCallId]
   );
   sessions.delete(waCallId);
+
+  if (result.rows[0]) {
+    emitToDashboard("call:updated", { id: result.rows[0].id, waCallId, status: "ended" });
+  }
 }
 
 export async function rejectIncomingCall(waCallId, reason) {
+  const session = sessions.get(waCallId);
+  if (session) clearTimeout(session.ringTimer);
   await rejectCall(waCallId);
-  await query("UPDATE calls SET status = 'rejected' WHERE wa_call_id = $1", [waCallId]);
+  const result = await query(
+    "UPDATE calls SET status = 'rejected' WHERE wa_call_id = $1 RETURNING id",
+    [waCallId]
+  );
+  sessions.delete(waCallId);
+  if (result.rows[0]) {
+    emitToDashboard("call:updated", { id: result.rows[0].id, waCallId, status: "rejected", reason });
+  }
 }
 
 export async function endCall(waCallId) {
   await terminateCall(waCallId);
   await handleCallTerminated(waCallId);
+}
+
+// Marks a call as failed and tries to politely reject it on the WhatsApp
+// side instead of leaving the caller hanging and the dashboard stuck on
+// "ringing" forever.
+async function failCall(waCallId, callId, err) {
+  const session = sessions.get(waCallId);
+  if (session) clearTimeout(session.ringTimer);
+  try {
+    await rejectCall(waCallId);
+  } catch (_) {}
+  await query("UPDATE calls SET status = 'failed', ended_at = now() WHERE id = $1", [callId]);
+  sessions.delete(waCallId);
+  emitToDashboard("call:updated", {
+    id: callId,
+    waCallId,
+    status: "failed",
+    error: err?.response?.data || err?.message || String(err),
+  });
 }
 
 // Speaks text into an active call via the self-hosted TTS service.

@@ -56,8 +56,8 @@ CREATE TABLE IF NOT EXISTS calls (
   contact_id INTEGER REFERENCES contacts(id) ON DELETE CASCADE,
   wa_call_id TEXT UNIQUE,
   direction TEXT NOT NULL, -- inbound | outbound
-  handled_by TEXT NOT NULL DEFAULT 'bot', -- bot | agent:<id>
-  status TEXT NOT NULL DEFAULT 'ringing', -- ringing | connected | ended | rejected | missed
+  handled_by TEXT NOT NULL DEFAULT 'bot', -- unassigned | bot | agent:<id>
+  status TEXT NOT NULL DEFAULT 'ringing', -- ringing | connected | ended | rejected | missed | failed
   consent_status TEXT DEFAULT 'not_required', -- not_required | requested | granted | denied
   recording_path TEXT,
   transcript JSONB DEFAULT '[]',
