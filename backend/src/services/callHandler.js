@@ -2,26 +2,31 @@ import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
 import dgram from "dgram";
-import { RTCPeerConnection, RTCRtpCodecParameters } from "werift";
+import {
+  MediaStreamTrack,
+  RTCPeerConnection,
+  RTCRtpCodecParameters,
+  RtpPacket,
+} from "werift";
 import { query } from "../db/index.js";
 import { preAcceptCall, acceptCall, rejectCall, terminateCall } from "./whatsapp.js";
 import { synthesize } from "./tts.js";
-import { emitToDashboard } from "../sockets.js";
+import { emitToDashboard, getOnlineAgentCount } from "../sockets.js";
 
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || "/app/recordings";
 if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
-const AGENT_RING_TIMEOUT_MS = Number(process.env.AGENT_RING_TIMEOUT_MS || 20000);
-const STALE_RINGING_MINUTES = Number(process.env.STALE_RINGING_MINUTES || 5);
-const STALE_CONNECTED_HOURS = Number(process.env.STALE_CONNECTED_HOURS || 12);
-
-// Active WebRTC sessions are process-local. Never classify a fresh database
-// row as missed merely because this particular process cannot see a session;
-// another replica may own it, or the Meta webhook may still be in flight.
+const AGENT_RING_TIMEOUT_MS = Number(process.env.AGENT_RING_TIMEOUT_MS || 15000);
+const ICE_GATHER_TIMEOUT_MS = Number(process.env.ICE_GATHER_TIMEOUT_MS || 8000);
 const sessions = new Map();
 
 function makePeerConnection() {
+  const iceServers = process.env.WEBRTC_STUN_URL
+    ? [{ urls: process.env.WEBRTC_STUN_URL }]
+    : [{ urls: "stun:stun.l.google.com:19302" }];
+
   return new RTCPeerConnection({
+    iceServers,
     codecs: {
       audio: [
         new RTCRtpCodecParameters({
@@ -29,15 +34,50 @@ function makePeerConnection() {
           clockRate: 48000,
           channels: 2,
           payloadType: 111,
+          parameters: "minptime=10;useinbandfec=1",
         }),
       ],
     },
   });
 }
 
+async function waitForIceGatheringComplete(pc) {
+  if (pc.iceGatheringState === "complete") return;
+  await new Promise((resolve) => {
+    let subscription;
+    const timer = setTimeout(() => {
+      subscription?.unSubscribe?.();
+      console.warn("[call] ICE gathering timed out; sending current SDP candidates");
+      resolve();
+    }, ICE_GATHER_TIMEOUT_MS);
+
+    subscription = pc.iceGatheringStateChange.subscribe((state) => {
+      if (state !== "complete") return;
+      clearTimeout(timer);
+      subscription?.unSubscribe?.();
+      resolve();
+    });
+  });
+}
+
+async function waitForConnected(pc, timeoutMs = 5000) {
+  if (pc.connectionState === "connected") return;
+  await new Promise((resolve) => {
+    let subscription;
+    const timer = setTimeout(() => {
+      subscription?.unSubscribe?.();
+      resolve();
+    }, timeoutMs);
+    subscription = pc.connectionStateChange.subscribe((state) => {
+      if (state !== "connected") return;
+      clearTimeout(timer);
+      subscription?.unSubscribe?.();
+      resolve();
+    });
+  });
+}
+
 export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
-  // Meta can retry the same connect webhook. Do not reset an existing
-  // connected/ended call back to ringing and do not create a second session.
   if (sessions.has(waCallId)) return sessions.get(waCallId).call;
 
   const inserted = await query(
@@ -55,40 +95,71 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
     if (!call || call.status !== "ringing") return call;
   }
 
+  let pc;
+  let recording;
   try {
-    const pc = makePeerConnection();
-    const recording = startRecording(waCallId);
+    pc = makePeerConnection();
+    const outboundTrack = new MediaStreamTrack({ kind: "audio" });
+    pc.addTransceiver(outboundTrack, { direction: "sendrecv" });
+    recording = startRecording(waCallId);
 
     pc.onTrack.subscribe((track) => {
       if (track.kind !== "audio") return;
       track.onReceiveRtp.subscribe((rtp) => recording.feed(rtp));
     });
 
-    await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    await preAcceptCall(waCallId, pc.localDescription.sdp);
-
-    const session = { pc, call, recording, contact, ringTimer: null, decided: false };
-    sessions.set(waCallId, session);
-
-    emitToDashboard("call:incoming", {
-      id: call.id,
-      waCallId,
-      contact: { id: contact.id, name: contact.name, wa_id: contact.wa_id },
-      ringTimeoutMs: AGENT_RING_TIMEOUT_MS,
-      startedAt: call.started_at,
+    pc.connectionStateChange.subscribe((state) => {
+      console.log(`[call ${waCallId}] WebRTC state: ${state}`);
+      if (state === "failed") {
+        failCall(waCallId, call.id, new Error("WebRTC connection failed")).catch(console.error);
+      }
     });
 
-    session.ringTimer = setTimeout(() => {
-      answerWithBot(waCallId).catch((err) =>
-        console.error(`[call ${waCallId}] auto-answer-with-bot failed`, err)
-      );
-    }, AGENT_RING_TIMEOUT_MS);
+    await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
+    await pc.setLocalDescription(await pc.createAnswer());
+    await waitForIceGatheringComplete(pc);
+
+    if (!pc.localDescription?.sdp) throw new Error("WebRTC answer SDP was not generated");
+
+    const session = {
+      pc,
+      call,
+      recording,
+      outboundTrack,
+      contact,
+      ringTimer: null,
+      decided: false,
+    };
+    sessions.set(waCallId, session);
+
+    console.log(`[call ${waCallId}] sending pre_accept with gathered ICE candidates`);
+    await preAcceptCall(waCallId, pc.localDescription.sdp);
+
+    if (getOnlineAgentCount() > 0) {
+      emitToDashboard("call:incoming", {
+        id: call.id,
+        waCallId,
+        contact: { id: contact.id, name: contact.name, wa_id: contact.wa_id },
+        startedAt: call.started_at,
+      });
+      session.ringTimer = setTimeout(() => {
+        answerWithBot(waCallId).catch((err) =>
+          console.error(`[call ${waCallId}] auto-answer-with-bot failed`, err)
+        );
+      }, AGENT_RING_TIMEOUT_MS);
+    } else {
+      console.log(`[call ${waCallId}] no dashboard agent online; routing directly to AI bot`);
+      setImmediate(() => answerWithBot(waCallId));
+    }
 
     return call;
   } catch (err) {
-    console.error(`[call ${waCallId}] failed to set up incoming call`, err);
+    console.error(
+      `[call ${waCallId}] setup failed`,
+      err.response?.data || err.stack || err.message || err
+    );
+    if (recording) recording.stop();
+    try { pc?.close(); } catch (_) {}
     await failCall(waCallId, call.id, err);
     throw err;
   }
@@ -97,7 +168,7 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
 export async function claimCallAsAgent(waCallId, user) {
   const session = sessions.get(waCallId);
   if (!session || session.decided) {
-    throw new Error("Call is no longer available to answer (already handled or ended).");
+    throw new Error("Call is no longer available to answer.");
   }
 
   session.decided = true;
@@ -105,9 +176,10 @@ export async function claimCallAsAgent(waCallId, user) {
 
   try {
     await acceptCall(waCallId, session.pc.localDescription.sdp);
+    await waitForConnected(session.pc);
     const handledBy = `agent:${user.id}`;
     const result = await query(
-      "UPDATE calls SET status = 'connected', handled_by = $1 WHERE id = $2 RETURNING *",
+      "UPDATE calls SET status='connected', handled_by=$1 WHERE id=$2 RETURNING *",
       [handledBy, session.call.id]
     );
     emitToDashboard("call:updated", {
@@ -118,7 +190,6 @@ export async function claimCallAsAgent(waCallId, user) {
     });
     return result.rows[0] || session.call;
   } catch (err) {
-    session.decided = false;
     await failCall(waCallId, session.call.id, err);
     throw err;
   }
@@ -132,11 +203,11 @@ export async function answerWithBot(waCallId) {
   clearTimeout(session.ringTimer);
 
   try {
+    console.log(`[call ${waCallId}] accepting call for AI bot`);
     await acceptCall(waCallId, session.pc.localDescription.sdp);
-    await query(
-      "UPDATE calls SET status = 'connected', handled_by = 'bot' WHERE id = $1",
-      [session.call.id]
-    );
+    await query("UPDATE calls SET status='connected', handled_by='bot' WHERE id=$1", [
+      session.call.id,
+    ]);
     emitToDashboard("call:updated", {
       id: session.call.id,
       waCallId,
@@ -144,62 +215,50 @@ export async function answerWithBot(waCallId) {
       handled_by: "bot",
     });
 
-    // Greeting generation currently exists, but outbound RTP injection still
-    // needs to be implemented for the installed werift version.
+    await waitForConnected(session.pc);
     await playGreeting(
       waCallId,
-      "Hi! Thanks for calling. This is our AI assistant, how can I help?"
+      process.env.CALL_GREETING ||
+        "Hi! Thanks for calling. This is our AI assistant. How can I help?"
     );
   } catch (err) {
-    console.error(`[call ${waCallId}] bot failed to answer`, err);
+    console.error(
+      `[call ${waCallId}] bot answer failed`,
+      err.response?.data || err.stack || err.message || err
+    );
     await failCall(waCallId, session.call.id, err);
   }
 }
 
-/**
- * Finalize a call even when its in-memory session is unavailable. Meta may
- * deliver termination to another replica or after a restart, so returning
- * early here leaves rows stuck or later misclassified as missed.
- */
 export async function handleCallTerminated(waCallId, outcome = "terminate") {
   const session = sessions.get(waCallId);
   let recordingPath = null;
-
   if (session) {
     clearTimeout(session.ringTimer);
     session.recording.stop();
     recordingPath = session.recording.outputPath;
-    try {
-      session.pc.close();
-    } catch (_) {}
+    try { session.pc.close(); } catch (_) {}
   }
 
   const existing = await query(
-    "SELECT id, status, handled_by, recording_path FROM calls WHERE wa_call_id = $1",
+    "SELECT id,status FROM calls WHERE wa_call_id=$1",
     [waCallId]
   );
   const row = existing.rows[0];
   sessions.delete(waCallId);
   if (!row) return;
 
-  let finalStatus;
-  if (outcome === "timeout") finalStatus = "missed";
-  else if (outcome === "reject") finalStatus = "rejected";
-  else finalStatus = row.status === "connected" ? "ended" : "missed";
-
-  // Never downgrade a call already recorded as failed/rejected/ended.
-  if (["failed", "rejected", "ended"].includes(row.status)) finalStatus = row.status;
+  let finalStatus = "missed";
+  if (outcome === "reject") finalStatus = "rejected";
+  else if (row.status === "connected") finalStatus = "ended";
+  else if (row.status === "failed") finalStatus = "failed";
 
   const result = await query(
-    `UPDATE calls
-       SET status = $1,
-           ended_at = COALESCE(ended_at, now()),
-           recording_path = COALESCE($2, recording_path)
-     WHERE wa_call_id = $3
-     RETURNING id, status`,
+    `UPDATE calls SET status=$1, ended_at=COALESCE(ended_at,now()),
+       recording_path=COALESCE($2,recording_path)
+     WHERE wa_call_id=$3 RETURNING id,status`,
     [finalStatus, recordingPath, waCallId]
   );
-
   if (result.rows[0]) {
     emitToDashboard("call:updated", {
       id: result.rows[0].id,
@@ -214,27 +273,21 @@ export async function rejectIncomingCall(waCallId, reason) {
   if (session) {
     clearTimeout(session.ringTimer);
     session.recording.stop();
-    try {
-      session.pc.close();
-    } catch (_) {}
+    try { session.pc.close(); } catch (_) {}
   }
-
-  try {
-    await rejectCall(waCallId);
-  } finally {
-    const result = await query(
-      "UPDATE calls SET status = 'rejected', ended_at = now() WHERE wa_call_id = $1 RETURNING id",
-      [waCallId]
-    );
-    sessions.delete(waCallId);
-    if (result.rows[0]) {
-      emitToDashboard("call:updated", {
-        id: result.rows[0].id,
-        waCallId,
-        status: "rejected",
-        reason,
-      });
-    }
+  try { await rejectCall(waCallId); } catch (_) {}
+  const result = await query(
+    "UPDATE calls SET status='rejected',ended_at=now() WHERE wa_call_id=$1 RETURNING id",
+    [waCallId]
+  );
+  sessions.delete(waCallId);
+  if (result.rows[0]) {
+    emitToDashboard("call:updated", {
+      id: result.rows[0].id,
+      waCallId,
+      status: "rejected",
+      reason,
+    });
   }
 }
 
@@ -248,16 +301,10 @@ async function failCall(waCallId, callId, err) {
   if (session) {
     clearTimeout(session.ringTimer);
     session.recording.stop();
-    try {
-      session.pc.close();
-    } catch (_) {}
+    try { session.pc.close(); } catch (_) {}
   }
-
-  try {
-    await rejectCall(waCallId);
-  } catch (_) {}
-
-  await query("UPDATE calls SET status = 'failed', ended_at = now() WHERE id = $1", [callId]);
+  try { await rejectCall(waCallId); } catch (_) {}
+  await query("UPDATE calls SET status='failed',ended_at=now() WHERE id=$1", [callId]);
   sessions.delete(waCallId);
   emitToDashboard("call:updated", {
     id: callId,
@@ -267,56 +314,78 @@ async function failCall(waCallId, callId, err) {
   });
 }
 
-/**
- * Reconcile only genuinely old rows. The old implementation marked every
- * session not found in this process as missed, which broke active calls on
- * restarts and multi-replica deployments.
- */
 export async function reconcileStaleCalls() {
   const stale = await query(
-    `SELECT id, wa_call_id, status
-       FROM calls
-      WHERE (status = 'ringing' AND started_at < now() - ($1 * interval '1 minute'))
-         OR (status = 'connected' AND started_at < now() - ($2 * interval '1 hour'))`,
-    [STALE_RINGING_MINUTES, STALE_CONNECTED_HOURS]
+    `SELECT id,wa_call_id,status FROM calls
+     WHERE (status='ringing' AND started_at < now() - interval '5 minutes')
+        OR (status='connected' AND started_at < now() - interval '12 hours')`
   );
-
-  let reconciled = 0;
   for (const row of stale.rows) {
     if (sessions.has(row.wa_call_id)) continue;
-    try {
-      await terminateCall(row.wa_call_id);
-    } catch (_) {}
-
-    const finalStatus = row.status === "connected" ? "ended" : "missed";
-    await query(
-      "UPDATE calls SET status = $1, ended_at = COALESCE(ended_at, now()) WHERE id = $2",
-      [finalStatus, row.id]
-    );
-    emitToDashboard("call:updated", {
-      id: row.id,
-      waCallId: row.wa_call_id,
-      status: finalStatus,
-    });
-    reconciled += 1;
+    try { await terminateCall(row.wa_call_id); } catch (_) {}
+    const status = row.status === "connected" ? "ended" : "missed";
+    await query("UPDATE calls SET status=$1,ended_at=COALESCE(ended_at,now()) WHERE id=$2", [
+      status,
+      row.id,
+    ]);
+    emitToDashboard("call:updated", { id: row.id, waCallId: row.wa_call_id, status });
   }
-
-  if (reconciled) console.log(`[calls] reconciled ${reconciled} genuinely stale call(s)`);
 }
 
-// A five-minute cadence matches the minimum stale ringing threshold and
-// avoids racing fresh Meta webhook events.
 setInterval(() => {
-  reconcileStaleCalls().catch((err) => console.error("[calls] stale-call sweep failed", err));
+  reconcileStaleCalls().catch((err) => console.error("[calls] stale sweep failed", err));
 }, 300000);
 
 async function playGreeting(waCallId, text) {
   const session = sessions.get(waCallId);
   if (!session) return;
+
   const mp3 = await synthesize(text);
-  console.log(
-    `[call ${waCallId}] TTS greeting generated (${mp3.length} bytes) - wire into outbound track`
+  const udp = dgram.createSocket("udp4");
+  const port = 30000 + Math.floor(Math.random() * 9000);
+
+  await new Promise((resolve, reject) => {
+    udp.once("error", reject);
+    udp.bind(port, "127.0.0.1", resolve);
+  });
+
+  udp.on("message", (data) => {
+    try {
+      const packet = RtpPacket.deSerialize(data);
+      packet.header.payloadType = 111;
+      session.outboundTrack.writeRtp(packet);
+    } catch (err) {
+      console.warn(`[call ${waCallId}] invalid generated RTP packet`, err.message);
+    }
+  });
+
+  const ffmpeg = spawn("ffmpeg", [
+    "-hide_banner",
+    "-loglevel", "error",
+    "-re",
+    "-i", "pipe:0",
+    "-vn",
+    "-acodec", "libopus",
+    "-ar", "48000",
+    "-ac", "2",
+    "-application", "voip",
+    "-frame_duration", "20",
+    "-payload_type", "111",
+    "-f", "rtp",
+    `rtp://127.0.0.1:${port}`,
+  ]);
+
+  ffmpeg.stdin.end(mp3);
+  ffmpeg.stderr.on("data", (data) =>
+    console.error(`[call ${waCallId}] ffmpeg TTS: ${data.toString().trim()}`)
   );
+
+  await new Promise((resolve) => {
+    ffmpeg.once("close", resolve);
+    ffmpeg.once("error", resolve);
+  });
+  udp.close();
+  console.log(`[call ${waCallId}] TTS greeting streamed into WhatsApp call`);
 }
 
 function startRecording(waCallId) {
@@ -339,27 +408,20 @@ function startRecording(waCallId) {
   );
 
   const ffmpeg = spawn("ffmpeg", [
-    "-protocol_whitelist",
-    "file,udp,rtp",
-    "-i",
-    sdpPath,
-    "-y",
-    outputPath,
+    "-protocol_whitelist", "file,udp,rtp",
+    "-i", sdpPath,
+    "-y", outputPath,
   ]);
   ffmpeg.stderr.on("data", () => {});
 
   return {
     outputPath,
     feed(rtp) {
-      try {
-        socket.send(rtp.serialize(), udpPort, "127.0.0.1");
-      } catch (_) {}
+      try { socket.send(rtp.serialize(), udpPort, "127.0.0.1"); } catch (_) {}
     },
     stop() {
-      try {
-        ffmpeg.kill("SIGINT");
-        socket.close();
-      } catch (_) {}
+      try { ffmpeg.kill("SIGINT"); } catch (_) {}
+      try { socket.close(); } catch (_) {}
     },
   };
 }
