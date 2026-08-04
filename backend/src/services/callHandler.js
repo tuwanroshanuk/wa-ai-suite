@@ -235,6 +235,7 @@ async function startPcmToWhatsApp(session) {
     try {
       const packet = RtpPacket.deSerialize(data);
       packet.header.payloadType = 111;
+      session.recorder.feedOutbound(packet);
       session.outboundTrack.writeRtp(packet);
     } catch (err) {
       console.warn(`[call ${session.call.wa_call_id}] invalid Gemini audio RTP`, err.message);
@@ -352,7 +353,7 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
       console.log(`[call ${waCallId}] WhatsApp inbound audio track received`);
       if (sessionRef) sessionRef.whatsappInboundTrack = track;
       track.onReceiveRtp.subscribe((rtp) => {
-        sessionRef?.recorder?.feed(rtp);
+        sessionRef?.recorder?.feedInbound(rtp);
         sessionRef?.transcriber?.feed(rtp);
         try { sessionRef?.agentOutboundTrack?.writeRtp(rtp); } catch (_) {}
       });
@@ -463,6 +464,7 @@ export async function claimCallAsAgent(waCallId, user, browserOfferSdp) {
       if (track.kind !== "audio") return;
       console.log(`[call ${waCallId}] agent microphone track received`);
       track.onReceiveRtp.subscribe((rtp) => {
+        session.recorder.feedOutbound(rtp);
         try { session.outboundTrack.writeRtp(rtp); } catch (_) {}
       });
     });
@@ -645,6 +647,7 @@ async function playCallTts(waCallId, text, source = "tts") {
         try {
           const packet = RtpPacket.deSerialize(data);
           packet.header.payloadType = 111;
+          active.recorder.feedOutbound(packet);
           active.outboundTrack.writeRtp(packet);
         } catch (err) {
           console.warn(`[call ${waCallId}] invalid generated RTP packet`, err.message);
