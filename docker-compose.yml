@@ -20,10 +20,25 @@ services:
     restart: unless-stopped
     environment:
       - PORT=6000
-      - TTS_PROVIDER=${TTS_PROVIDER:-auto}
-      - TTS_DEFAULT_VOICE=${TTS_DEFAULT_VOICE:-en-US-AriaNeural}
+      - TTS_PROVIDER=${TTS_PROVIDER:-piper}
+      - TTS_DEFAULT_VOICE=${TTS_DEFAULT_VOICE:-en_US-lessac-medium}
+      - TTS_DEFAULT_SPEED=${TTS_DEFAULT_SPEED:-1}
+      - TTS_MODEL_DIR=/models
       - TTS_ESPEAK_VOICE=${TTS_ESPEAK_VOICE:-en-us}
       - TTS_ESPEAK_SPEED=${TTS_ESPEAK_SPEED:-165}
+
+  stt-service:
+    build:
+      context: ./stt-service
+      args:
+        STT_MODEL: ${STT_MODEL:-base}
+    restart: unless-stopped
+    environment:
+      - STT_MODEL=${STT_MODEL:-base}
+      - STT_DEVICE=cpu
+      - STT_COMPUTE_TYPE=int8
+      - STT_CPU_THREADS=${STT_CPU_THREADS:-4}
+      - STT_MODEL_DIR=/models
 
   backend:
     build: ./backend
@@ -32,12 +47,16 @@ services:
       - postgres
       - redis
       - tts-service
+      - stt-service
     env_file:
       - .env
     environment:
       - DATABASE_URL=postgres://${POSTGRES_USER:-wa_user}:${POSTGRES_PASSWORD:-wa_pass}@postgres:5432/${POSTGRES_DB:-wa_suite}
       - REDIS_URL=redis://redis:6379
       - TTS_SERVICE_URL=http://tts-service:6000
+      - STT_SERVICE_URL=http://stt-service:7000
+      - STT_PROVIDER=${STT_PROVIDER:-local}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash-lite}
       - WEBRTC_PUBLIC_IP=${WEBRTC_PUBLIC_IP:-62.171.189.222}
       - WEBRTC_ICE_MIN_PORT=50000
       - WEBRTC_ICE_MAX_PORT=50010
