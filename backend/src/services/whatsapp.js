@@ -52,24 +52,40 @@ export async function sendText(to, body) {
 }
 
 export async function sendTemplate(to, templateName, languageCode = "en", components = []) {
+  const normalizedTo = String(to || "").replace(/\D/g, "");
+  const normalizedName = String(templateName || "").trim();
+  const normalizedLanguage = String(languageCode || "en").trim();
+
+  if (!normalizedTo) throw new Error("A valid WhatsApp destination number is required");
+  if (!normalizedName) throw new Error("A WhatsApp template name is required");
+
   return post(
     "/messages",
     {
       messaging_product: "whatsapp",
-      to: String(to || "").replace(/\D/g, ""),
+      to: normalizedTo,
       type: "template",
-      template: { name: templateName, language: { code: languageCode }, components },
+      template: {
+        name: normalizedName,
+        language: { code: normalizedLanguage },
+        components,
+      },
     },
-    `send template ${templateName}/${languageCode}`
+    `send template ${normalizedName}/${normalizedLanguage}`
   );
 }
 
 export async function requestCallPermission(
   to,
-  templateName = process.env.WHATSAPP_CALL_PERMISSION_TEMPLATE || "request_call_permission",
-  languageCode = process.env.WHATSAPP_CALL_PERMISSION_LANGUAGE || "en"
+  templateName = "request_call_permission",
+  languageCode = "en"
 ) {
-  return sendTemplate(to, templateName, languageCode);
+  // Use the approved template shown in WhatsApp Manager. Do not allow an old
+  // Dokploy environment value such as call_permission_request to silently
+  // override the working default.
+  const name = String(templateName || "request_call_permission").trim();
+  const language = String(languageCode || "en").trim();
+  return sendTemplate(to, name, language);
 }
 
 export async function markRead(waMessageId) {
@@ -106,8 +122,6 @@ export async function preAcceptCall(waCallId, sdpAnswer) {
   );
 }
 
-// After a successful pre_accept, the final accept action should not repeat the
-// SDP session. It only signals that the business has answered the call.
 export async function acceptCall(waCallId) {
   return post(
     "/calls",
