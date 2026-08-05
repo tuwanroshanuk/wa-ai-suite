@@ -2,415 +2,300 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { getSocket } from "../socket";
 
-const FINAL_STATUSES = new Set(["ended", "missed", "rejected", "failed"]);
+const FINAL = new Set(["ended", "missed", "rejected", "failed"]);
 
-function waitForIceGathering(pc, timeoutMs = 2500) {
+function waitForIce(pc, timeout = 2500) {
   if (pc.iceGatheringState === "complete") return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, timeoutMs);
-    const onState = () => {
+    const timer = setTimeout(resolve, timeout);
+    const listener = () => {
       if (pc.iceGatheringState !== "complete") return;
       clearTimeout(timer);
-      pc.removeEventListener("icegatheringstatechange", onState);
+      pc.removeEventListener("icegatheringstatechange", listener);
       resolve();
     };
-    pc.addEventListener("icegatheringstatechange", onState);
+    pc.addEventListener("icegatheringstatechange", listener);
   });
 }
 
-function startOriginalRingtone() {
-  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContextClass) return () => {};
-
-  const context = new AudioContextClass();
+function startRingtone() {
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContext) return () => {};
+  const context = new AudioContext();
+  let timer;
   let stopped = false;
-  let timer = null;
-
   const ring = () => {
     if (stopped) return;
     context.resume().catch(() => {});
     const now = context.currentTime;
     const gain = context.createGain();
     gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.exponentialRampToValueAtTime(0.13, now + 0.03);
-    gain.gain.setValueAtTime(0.13, now + 0.42);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.52);
-    gain.gain.setValueAtTime(0.0001, now + 0.66);
-    gain.gain.exponentialRampToValueAtTime(0.13, now + 0.7);
-    gain.gain.setValueAtTime(0.13, now + 1.08);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + 1.18);
+    gain.gain.exponentialRampToValueAtTime(0.12, now + 0.03);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 1.15);
+    const a = context.createOscillator();
+    const b = context.createOscillator();
+    a.frequency.value = 523.25;
+    b.frequency.value = 659.25;
+    a.connect(gain);
+    b.connect(gain);
     gain.connect(context.destination);
-
-    const low = context.createOscillator();
-    const high = context.createOscillator();
-    low.type = "sine";
-    high.type = "sine";
-    low.frequency.value = 523.25;
-    high.frequency.value = 659.25;
-    low.connect(gain);
-    high.connect(gain);
-    low.start(now);
-    high.start(now);
-    low.stop(now + 1.2);
-    high.stop(now + 1.2);
+    a.start(now); b.start(now);
+    a.stop(now + 1.2); b.stop(now + 1.2);
   };
-
   ring();
-  timer = window.setInterval(ring, 2850);
-
+  timer = setInterval(ring, 2800);
   return () => {
     stopped = true;
-    if (timer) window.clearInterval(timer);
+    clearInterval(timer);
     context.close().catch(() => {});
   };
 }
 
 export default function IncomingCallOverlay() {
-  const [incoming, setIncoming] = useState(null);
+  const [call, setCall] = useState(null);
   const [phase, setPhase] = useState("ringing");
   const [busy, setBusy] = useState(false);
+  const [remaining, setRemaining] = useState(15);
+  const [seconds, setSeconds] = useState(0);
   const [muted, setMuted] = useState(false);
   const [mediaState, setMediaState] = useState("idle");
-  const [seconds, setSeconds] = useState(0);
-  const [remaining, setRemaining] = useState(15);
-  const [showDeclineReason, setShowDeclineReason] = useState(false);
-  const [declineReason, setDeclineReason] = useState("");
-  const [transferReason, setTransferReason] = useState("");
-  const [promptText, setPromptText] = useState("");
-  const [promptState, setPromptState] = useState("idle");
+  const [reason, setReason] = useState("");
+  const [showReason, setShowReason] = useState(false);
+  const [prompt, setPrompt] = useState("");
   const [transcript, setTranscript] = useState([]);
 
-  const pcRef = useRef(null);
-  const micStreamRef = useRef(null);
-  const remoteAudioRef = useRef(null);
-  const incomingRef = useRef(null);
+  const callRef = useRef(null);
   const phaseRef = useRef("ringing");
-  const ringtoneStopRef = useRef(null);
+  const pcRef = useRef(null);
+  const micRef = useRef(null);
+  const remoteRef = useRef(null);
+  const ringStopRef = useRef(null);
   const audioContextRef = useRef(null);
-  const mixDestinationRef = useRef(null);
+  const destinationRef = useRef(null);
   const micGainRef = useRef(null);
 
-  useEffect(() => {
-    incomingRef.current = incoming;
-  }, [incoming]);
+  useEffect(() => { callRef.current = call; }, [call]);
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
 
-  useEffect(() => {
-    phaseRef.current = phase;
-  }, [phase]);
-
-  function stopRingtone() {
-    ringtoneStopRef.current?.();
-    ringtoneStopRef.current = null;
+  function stopRing() {
+    ringStopRef.current?.();
+    ringStopRef.current = null;
   }
 
   function cleanupMedia() {
     try { pcRef.current?.close(); } catch (_) {}
     pcRef.current = null;
-    for (const track of micStreamRef.current?.getTracks?.() || []) {
-      try { track.stop(); } catch (_) {}
-    }
-    micStreamRef.current = null;
-    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+    micRef.current?.getTracks?.().forEach((track) => track.stop());
+    micRef.current = null;
+    if (remoteRef.current) remoteRef.current.srcObject = null;
     try { audioContextRef.current?.close(); } catch (_) {}
     audioContextRef.current = null;
-    mixDestinationRef.current = null;
+    destinationRef.current = null;
     micGainRef.current = null;
-    setMuted(false);
     setMediaState("idle");
-    setSeconds(0);
-    setPromptState("idle");
+    setMuted(false);
   }
 
-  function resetDialog() {
-    stopRingtone();
+  function closeDialog() {
+    stopRing();
     cleanupMedia();
-    setIncoming(null);
+    setCall(null);
     setPhase("ringing");
-    setShowDeclineReason(false);
-    setDeclineReason("");
-    setTransferReason("");
-    setPromptText("");
+    setReason("");
+    setShowReason(false);
+    setPrompt("");
     setTranscript([]);
+    setSeconds(0);
   }
 
-  function beginRinging(payload) {
-    stopRingtone();
+  function begin(payload) {
+    stopRing();
     cleanupMedia();
-    setIncoming(payload);
+    setCall(payload);
     setTranscript(Array.isArray(payload.transcript) ? payload.transcript : []);
     setPhase("ringing");
-    setShowDeclineReason(false);
-    setRemaining(15);
-    ringtoneStopRef.current = startOriginalRingtone();
+    setShowReason(false);
+    setRemaining(Math.ceil(Number(payload.ringTimeoutMs || 15000) / 1000));
+    ringStopRef.current = startRingtone();
   }
 
-  async function loadActiveCall() {
+  async function recover() {
     try {
       const response = await api.get("/api/calls/active");
-      if (response.data) {
-        const current = incomingRef.current;
-        if (!current || current.id !== response.data.id) beginRinging(response.data);
-      } else if (phaseRef.current === "ringing") {
-        stopRingtone();
-        setIncoming(null);
+      if (response.data && callRef.current?.id !== response.data.id) begin(response.data);
+      if (!response.data && phaseRef.current === "ringing") {
+        stopRing();
+        setCall(null);
       }
-    } catch (err) {
-      console.warn("[calls] could not recover active call", err.message);
+    } catch (error) {
+      console.warn("[calls] active call recovery failed", error.message);
     }
   }
 
   useEffect(() => {
     const socket = getSocket();
-
-    const onIncoming = (payload) => beginRinging(payload);
-
-    const onUpdated = (payload) => {
-      const current = incomingRef.current;
-      if (!current || current.id !== payload.id) return;
-
-      if (FINAL_STATUSES.has(payload.status)) {
-        resetDialog();
-        return;
-      }
-
-      if (payload.status === "connected") {
-        stopRingtone();
-        if (payload.handled_by === "bot") {
-          setPhase("transferring");
-          cleanupMedia();
-          window.setTimeout(() => {
-            if (incomingRef.current?.id === payload.id) resetDialog();
-          }, 1800);
-          return;
-        }
+    const incoming = (payload) => begin(payload);
+    const updated = (payload) => {
+      if (callRef.current?.id !== payload.id) return;
+      if (FINAL.has(payload.status)) return closeDialog();
+      if (payload.status === "connected" && payload.handled_by === "ivr") {
+        stopRing();
+        cleanupMedia();
+        setPhase("ivr");
+        setTimeout(() => callRef.current?.id === payload.id && closeDialog(), 1800);
+      } else if (payload.status === "connected") {
+        stopRing();
         setPhase("connected");
       }
     };
-
-    const onAgentMedia = (payload) => {
-      const current = incomingRef.current;
-      if (current?.id === payload.id) setMediaState(payload.state);
+    const media = (payload) => callRef.current?.id === payload.id && setMediaState(payload.state);
+    const text = (payload) => {
+      if (callRef.current?.id === payload.id && payload.entry) {
+        setTranscript((items) => [...items, payload.entry].slice(-20));
+      }
     };
-
-    const onTranscript = (payload) => {
-      const current = incomingRef.current;
-      if (current?.id !== payload.id || !payload.entry) return;
-      setTranscript((items) => [...items, payload.entry].slice(-12));
-    };
-
-    const onPromptState = (payload) => {
-      const current = incomingRef.current;
-      if (current?.id === payload.id) setPromptState(payload.state || "idle");
-    };
-
-    const onConnect = () => loadActiveCall();
-
-    socket.on("connect", onConnect);
-    socket.on("call:incoming", onIncoming);
-    socket.on("call:updated", onUpdated);
-    socket.on("call:agent-media", onAgentMedia);
-    socket.on("call:transcript", onTranscript);
-    socket.on("call:prompt-state", onPromptState);
-    loadActiveCall();
-
+    socket.on("connect", recover);
+    socket.on("call:incoming", incoming);
+    socket.on("call:updated", updated);
+    socket.on("call:agent-media", media);
+    socket.on("call:transcript", text);
+    recover();
     return () => {
-      socket.off("connect", onConnect);
-      socket.off("call:incoming", onIncoming);
-      socket.off("call:updated", onUpdated);
-      socket.off("call:agent-media", onAgentMedia);
-      socket.off("call:transcript", onTranscript);
-      socket.off("call:prompt-state", onPromptState);
-      stopRingtone();
+      socket.off("connect", recover);
+      socket.off("call:incoming", incoming);
+      socket.off("call:updated", updated);
+      socket.off("call:agent-media", media);
+      socket.off("call:transcript", text);
+      stopRing();
       cleanupMedia();
     };
   }, []);
 
   useEffect(() => {
-    if (!incoming || phase !== "ringing") return undefined;
-
-    const fallbackTarget = Date.now() + 15000;
-    const update = () => {
-      const target = incoming.autoTransferAt
-        ? new Date(incoming.autoTransferAt).getTime()
-        : fallbackTarget;
-      const value = Math.max(0, Math.ceil((target - Date.now()) / 1000));
+    if (!call || phase !== "ringing") return;
+    const fallback = Date.now() + Number(call.ringTimeoutMs || 15000);
+    const tick = () => {
+      const deadline = call.autoTransferAt ? new Date(call.autoTransferAt).getTime() : fallback;
+      const value = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
       setRemaining(value);
-      if (value <= 0) {
-        stopRingtone();
-        setPhase("transferring");
+      if (!value) {
+        stopRing();
+        setPhase("ivr");
       }
     };
-
-    update();
-    const timer = window.setInterval(update, 250);
-    return () => window.clearInterval(timer);
-  }, [incoming?.id, incoming?.autoTransferAt, phase]);
+    tick();
+    const timer = setInterval(tick, 250);
+    return () => clearInterval(timer);
+  }, [call?.id, call?.autoTransferAt, phase]);
 
   useEffect(() => {
-    if (phase !== "connected") return undefined;
-    const timer = window.setInterval(() => setSeconds((value) => value + 1), 1000);
-    return () => window.clearInterval(timer);
+    if (phase !== "connected") return;
+    const timer = setInterval(() => setSeconds((value) => value + 1), 1000);
+    return () => clearInterval(timer);
   }, [phase]);
 
-  if (!incoming) return null;
+  if (!call) return null;
 
   async function answer() {
     setBusy(true);
-    stopRingtone();
+    stopRing();
     setPhase("connecting");
-    setMediaState("requesting microphone");
-
     try {
       if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-        throw new Error("Microphone calling requires HTTPS and a supported browser.");
+        throw new Error("Browser calling requires HTTPS and microphone support.");
       }
-
-      const micStream = await navigator.mediaDevices.getUserMedia({
+      const mic = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
         video: false,
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-        },
       });
-      micStreamRef.current = micStream;
+      micRef.current = mic;
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      const context = new AudioContext();
+      await context.resume();
+      const source = context.createMediaStreamSource(mic);
+      const gain = context.createGain();
+      const destination = context.createMediaStreamDestination();
+      source.connect(gain);
+      gain.connect(destination);
+      audioContextRef.current = context;
+      destinationRef.current = destination;
+      micGainRef.current = gain;
 
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      const audioContext = new AudioContextClass();
-      await audioContext.resume();
-      const micSource = audioContext.createMediaStreamSource(micStream);
-      const micGain = audioContext.createGain();
-      const destination = audioContext.createMediaStreamDestination();
-      micSource.connect(micGain);
-      micGain.connect(destination);
-      audioContextRef.current = audioContext;
-      micGainRef.current = micGain;
-      mixDestinationRef.current = destination;
-
-      const pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
-      });
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
       pcRef.current = pc;
-
-      pc.onconnectionstatechange = () => {
-        setMediaState(pc.connectionState);
-        if (["failed", "closed"].includes(pc.connectionState) && incomingRef.current) {
-          console.warn(`[calls] browser media state: ${pc.connectionState}`);
-        }
-      };
-
+      pc.onconnectionstatechange = () => setMediaState(pc.connectionState);
       pc.ontrack = async (event) => {
-        const stream = event.streams?.[0] || new MediaStream([event.track]);
-        if (!remoteAudioRef.current) return;
-        remoteAudioRef.current.srcObject = stream;
-        try { await remoteAudioRef.current.play(); } catch (_) {}
+        if (!remoteRef.current) return;
+        remoteRef.current.srcObject = event.streams?.[0] || new MediaStream([event.track]);
+        await remoteRef.current.play().catch(() => {});
       };
-
-      const mixedTrack = destination.stream.getAudioTracks()[0];
-      pc.addTrack(mixedTrack, destination.stream);
-
-      const offer = await pc.createOffer({ offerToReceiveAudio: true });
-      await pc.setLocalDescription(offer);
-      await waitForIceGathering(pc);
-
-      const response = await api.post(`/api/calls/${incoming.id}/answer`, {
-        offerSdp: pc.localDescription?.sdp,
-      });
-
-      if (!response.data?.answerSdp) {
-        throw new Error("Server did not return a WebRTC audio answer.");
-      }
-
+      pc.addTrack(destination.stream.getAudioTracks()[0], destination.stream);
+      await pc.setLocalDescription(await pc.createOffer({ offerToReceiveAudio: true }));
+      await waitForIce(pc);
+      const response = await api.post(`/api/calls/${call.id}/answer`, { offerSdp: pc.localDescription?.sdp });
       await pc.setRemoteDescription({ type: "answer", sdp: response.data.answerSdp });
       setPhase("connected");
-      setMediaState(pc.connectionState || "connecting");
       setSeconds(0);
-    } catch (err) {
+    } catch (error) {
       cleanupMedia();
-      if (err.response?.status === 409 || err.response?.status === 404) {
-        setIncoming(null);
-        await loadActiveCall();
+      if ([404, 409].includes(error.response?.status)) {
+        closeDialog();
+        await recover();
       } else {
         setPhase("ringing");
-        ringtoneStopRef.current = startOriginalRingtone();
-        alert(err.response?.data?.error || err.message || "Could not connect the microphone call.");
+        ringStopRef.current = startRingtone();
+        alert(error.response?.data?.error || error.message);
       }
     } finally {
       setBusy(false);
     }
   }
 
-  async function declineToAi() {
-    if (!showDeclineReason) {
-      setShowDeclineReason(true);
-      return;
-    }
-
+  async function declineToIvr() {
+    if (!showReason) return setShowReason(true);
     setBusy(true);
-    stopRingtone();
-    setPhase("transferring");
+    stopRing();
+    setPhase("ivr");
     try {
-      await api.post(`/api/calls/${incoming.id}/decline`, { reason: declineReason });
-    } catch (err) {
-      if (err.response?.status === 409 || err.response?.status === 404) {
-        resetDialog();
-        await loadActiveCall();
-      } else {
-        setPhase("ringing");
-        ringtoneStopRef.current = startOriginalRingtone();
-        alert(err.response?.data?.error || err.message || "Could not transfer the call to AI.");
-      }
+      await api.post(`/api/calls/${call.id}/decline`, { reason });
+    } catch (error) {
+      setPhase("ringing");
+      ringStopRef.current = startRingtone();
+      alert(error.response?.data?.error || error.message);
     } finally {
       setBusy(false);
     }
   }
 
-  async function transferToAi() {
+  async function transferToIvr() {
     setBusy(true);
-    setPhase("transferring");
+    setPhase("ivr");
     try {
-      await api.post(`/api/calls/${incoming.id}/transfer-to-bot`, {
-        reason: transferReason,
-      });
+      await api.post(`/api/calls/${call.id}/transfer-to-ivr`, { reason });
       cleanupMedia();
-    } catch (err) {
+    } catch (error) {
       setPhase("connected");
-      alert(err.response?.data?.error || err.message || "Could not transfer the call to AI.");
+      alert(error.response?.data?.error || error.message);
     } finally {
       setBusy(false);
     }
   }
 
-  async function playAiPrompt() {
-    const text = promptText.trim();
-    if (!text || !audioContextRef.current || !mixDestinationRef.current) return;
-
+  async function playPrompt() {
+    if (!prompt.trim() || !audioContextRef.current || !destinationRef.current) return;
     setBusy(true);
-    setPromptState("generating");
     try {
-      const response = await api.post(
-        `/api/calls/${incoming.id}/prompt-audio`,
-        { text },
-        { responseType: "arraybuffer" }
-      );
-
-      const context = audioContextRef.current;
-      const audioBuffer = await context.decodeAudioData(response.data.slice(0));
-      const source = context.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(mixDestinationRef.current);
-      source.connect(context.destination);
-      setPromptState("playing");
+      const response = await api.post(`/api/calls/${call.id}/prompt-audio`, { text: prompt.trim() }, { responseType: "arraybuffer" });
+      const buffer = await audioContextRef.current.decodeAudioData(response.data.slice(0));
+      const source = audioContextRef.current.createBufferSource();
+      source.buffer = buffer;
+      source.connect(destinationRef.current);
+      source.connect(audioContextRef.current.destination);
       source.start();
-      await new Promise((resolve) => {
-        source.onended = resolve;
-      });
-      setPromptText("");
-      setPromptState("idle");
-    } catch (err) {
-      setPromptState("idle");
-      alert(err.response?.data?.error || err.message || "Could not play the AI voice prompt.");
+      await new Promise((resolve) => { source.onended = resolve; });
+      setPrompt("");
+    } catch (error) {
+      alert(error.response?.data?.error || error.message);
     } finally {
       setBusy(false);
     }
@@ -418,288 +303,90 @@ export default function IncomingCallOverlay() {
 
   async function hangup() {
     setBusy(true);
-    try {
-      await api.post(`/api/calls/${incoming.id}/end`, {});
-    } catch (err) {
-      if (![404, 409].includes(err.response?.status)) {
-        alert(err.response?.data?.error || err.message || "Could not end the call.");
-      }
-    } finally {
-      resetDialog();
-      setBusy(false);
-    }
+    try { await api.post(`/api/calls/${call.id}/end`, {}); } catch (_) {}
+    closeDialog();
+    setBusy(false);
   }
 
-  function toggleMute() {
-    const next = !muted;
-    if (micGainRef.current) micGainRef.current.gain.value = next ? 0 : 1;
-    setMuted(next);
-  }
-
-  const label = incoming.contact?.name || incoming.contact?.wa_id || "WhatsApp customer";
-  const time = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
-  const connected = phase === "connected";
+  const caller = call.contact?.name || call.contact?.wa_id || "WhatsApp customer";
+  const timer = `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 
   return (
     <div style={styles.backdrop}>
-      <audio ref={remoteAudioRef} autoPlay playsInline />
-      <div style={styles.dialog} role="dialog" aria-modal="true" aria-label="WhatsApp voice call">
-        <div style={{ ...styles.icon, ...(connected ? styles.iconConnected : {}) }}>
-          {connected ? "●" : phase === "transferring" ? "AI" : "☎"}
-        </div>
-
+      <audio ref={remoteRef} autoPlay playsInline />
+      <div style={styles.dialog}>
+        <div style={styles.icon}>{phase === "ivr" ? "IVR" : phase === "connected" ? "●" : "☎"}</div>
         <div style={styles.eyebrow}>
-          {phase === "ringing" && `Incoming WhatsApp call · AI in ${remaining}s`}
+          {phase === "ringing" && `Incoming WhatsApp call · IVR in ${remaining}s`}
           {phase === "connecting" && "Connecting microphone…"}
-          {phase === "transferring" && "Transferring to AI assistant…"}
-          {phase === "connected" && `Live call · ${time}`}
+          {phase === "ivr" && "Transferring to automated phone menu…"}
+          {phase === "connected" && `Live browser call · ${timer}`}
         </div>
-        <h2 style={styles.title}>{label}</h2>
+        <h2 style={{ margin: "5px 0" }}>{caller}</h2>
         <p style={styles.description}>
-          {phase === "ringing"
-            ? "Answer in this browser. Decline transfers the caller to AI instead of ending the call."
-            : phase === "connecting"
-              ? "Allow microphone access. Caller audio will play through this device."
-              : phase === "transferring"
-                ? "The caller will hear a transfer message, then the AI will continue the conversation."
-                : `${muted ? "Microphone muted" : "Microphone live"} · Media ${mediaState}`}
+          {phase === "ringing" && "Answer in this browser or route the caller into the published visual IVR."}
+          {phase === "connecting" && "Allow microphone access to complete the browser audio bridge."}
+          {phase === "ivr" && "Local speech recognition and neural voice prompts will continue the call."}
+          {phase === "connected" && `${muted ? "Microphone muted" : "Microphone live"} · Media ${mediaState}`}
         </p>
 
-        {phase === "ringing" && showDeclineReason && (
+        {phase === "ringing" && showReason && <div style={styles.panel}>
+          <label style={styles.label}>Optional reason spoken before the IVR starts</label>
+          <textarea rows={3} value={reason} onChange={(event) => setReason(event.target.value)} style={styles.input} placeholder="All agents are assisting other customers." />
+        </div>}
+
+        {phase === "connected" && <>
           <div style={styles.panel}>
-            <label style={styles.label}>Optional decline reason spoken to the caller</label>
-            <textarea
-              rows={3}
-              value={declineReason}
-              onChange={(event) => setDeclineReason(event.target.value)}
-              placeholder="Example: All agents are helping other customers right now."
-              style={styles.textarea}
-            />
-            <button
-              type="button"
-              onClick={() => setShowDeclineReason(false)}
-              style={styles.linkButton}
-            >
-              Cancel
-            </button>
+            <label style={styles.label}>Play a local neural voice prompt during the call</label>
+            <textarea rows={2} value={prompt} onChange={(event) => setPrompt(event.target.value)} style={styles.input} placeholder="Type the prompt to play alongside your microphone." />
+            <button className="secondary" disabled={busy || !prompt.trim()} onClick={playPrompt} style={{ width: "100%", marginTop: 8 }}>Play voice prompt</button>
           </div>
-        )}
-
-        {connected && (
-          <>
-            <div style={styles.panel}>
-              <label style={styles.label}>AI voice prompt mixed with your microphone</label>
-              <textarea
-                rows={2}
-                value={promptText}
-                onChange={(event) => setPromptText(event.target.value)}
-                placeholder="Type something for the AI voice to say to the caller…"
-                style={styles.textarea}
-              />
-              <button
-                disabled={busy || !promptText.trim()}
-                onClick={playAiPrompt}
-                style={styles.promptButton}
-              >
-                {promptState === "generating"
-                  ? "Generating voice…"
-                  : promptState === "playing"
-                    ? "Playing…"
-                    : "Play AI voice"}
-              </button>
-            </div>
-
-            <div style={styles.panel}>
-              <label style={styles.label}>Transfer to AI assistant</label>
-              <input
-                value={transferReason}
-                onChange={(event) => setTransferReason(event.target.value)}
-                placeholder="Optional transfer reason"
-                style={styles.input}
-              />
-            </div>
-          </>
-        )}
-
-        {transcript.length > 0 && (
-          <div style={styles.transcript}>
-            <div style={styles.label}>Live transcript</div>
-            {transcript.slice(-4).map((entry, index) => (
-              <div key={`${entry.at || index}-${index}`} style={styles.transcriptLine}>
-                <strong>{entry.role === "caller" ? "Caller" : entry.role === "assistant" ? "AI" : "Agent"}:</strong>{" "}
-                {entry.text}
-              </div>
-            ))}
+          <div style={styles.panel}>
+            <label style={styles.label}>Optional transfer reason</label>
+            <input value={reason} onChange={(event) => setReason(event.target.value)} style={styles.input} />
           </div>
-        )}
+        </>}
 
-        {phase === "ringing" ? (
-          <div style={styles.actions}>
-            <button disabled={busy} onClick={declineToAi} style={styles.decline}>
-              {showDeclineReason ? "Transfer to AI" : "Decline → AI"}
-            </button>
-            <button disabled={busy} onClick={answer} style={styles.answer}>Answer</button>
-          </div>
-        ) : connected ? (
-          <div style={styles.actionsWrap}>
-            <button disabled={busy} onClick={toggleMute} style={styles.secondary}>
-              {muted ? "Unmute" : "Mute"}
-            </button>
-            <button disabled={busy} onClick={transferToAi} style={styles.transfer}>
-              Transfer to AI
-            </button>
-            <button disabled={busy} onClick={hangup} style={styles.hangup}>End call</button>
-          </div>
-        ) : null}
+        {transcript.length > 0 && <div style={styles.transcript}>
+          <strong style={{ fontSize: 12 }}>Live transcript</strong>
+          {transcript.slice(-5).map((entry, index) => <div key={`${entry.at || index}-${index}`} style={styles.line}>
+            <b>{entry.role === "caller" ? "Caller" : entry.role === "ivr" ? "IVR" : "Agent"}:</b> {entry.text}
+          </div>)}
+        </div>}
+
+        {phase === "ringing" && <div style={styles.actions}>
+          <button disabled={busy} onClick={declineToIvr} style={styles.decline}>{showReason ? "Start IVR" : "Decline → IVR"}</button>
+          <button disabled={busy} onClick={answer} style={styles.answer}>Answer</button>
+        </div>}
+        {phase === "connected" && <div style={styles.connectedActions}>
+          <button className="secondary" disabled={busy} onClick={() => {
+            const next = !muted;
+            if (micGainRef.current) micGainRef.current.gain.value = next ? 0 : 1;
+            setMuted(next);
+          }}>{muted ? "Unmute" : "Mute"}</button>
+          <button disabled={busy} onClick={transferToIvr} style={styles.transfer}>Transfer to IVR</button>
+          <button disabled={busy} onClick={hangup} style={styles.hangup}>End call</button>
+        </div>}
       </div>
     </div>
   );
 }
 
 const styles = {
-  backdrop: {
-    position: "fixed",
-    inset: 0,
-    zIndex: 9999,
-    display: "grid",
-    placeItems: "center",
-    padding: 20,
-    background: "rgba(16,24,40,.55)",
-    backdropFilter: "blur(7px)",
-    overflowY: "auto",
-  },
-  dialog: {
-    width: "min(520px, 100%)",
-    maxHeight: "calc(100vh - 40px)",
-    overflowY: "auto",
-    padding: 28,
-    borderRadius: 22,
-    background: "#fff",
-    boxShadow: "0 24px 80px rgba(16,24,40,.3)",
-    textAlign: "center",
-  },
-  icon: {
-    width: 66,
-    height: 66,
-    margin: "0 auto 16px",
-    borderRadius: "50%",
-    display: "grid",
-    placeItems: "center",
-    background: "#dcfce7",
-    color: "#15803d",
-    fontSize: 26,
-    fontWeight: 800,
-  },
-  iconConnected: {
-    background: "#fee2e2",
-    color: "#dc2626",
-    fontSize: 20,
-  },
-  eyebrow: { fontSize: 13, color: "#667085", marginBottom: 6 },
-  title: { margin: 0, fontSize: 23 },
-  description: { color: "#667085", margin: "9px 0 20px", lineHeight: 1.5 },
-  panel: {
-    padding: 14,
-    marginBottom: 14,
-    border: "1px solid #e4e7ec",
-    borderRadius: 14,
-    background: "#f9fafb",
-    textAlign: "left",
-  },
-  label: { display: "block", fontSize: 12, fontWeight: 700, color: "#344054", marginBottom: 7 },
-  textarea: {
-    width: "100%",
-    boxSizing: "border-box",
-    resize: "vertical",
-    border: "1px solid #d0d5dd",
-    borderRadius: 10,
-    padding: 10,
-    font: "inherit",
-  },
-  input: {
-    width: "100%",
-    boxSizing: "border-box",
-    border: "1px solid #d0d5dd",
-    borderRadius: 10,
-    padding: 10,
-    font: "inherit",
-  },
-  transcript: {
-    padding: 13,
-    marginBottom: 16,
-    borderRadius: 12,
-    background: "#f2f4f7",
-    textAlign: "left",
-    maxHeight: 150,
-    overflowY: "auto",
-  },
-  transcriptLine: { fontSize: 12, lineHeight: 1.45, color: "#475467", marginTop: 5 },
-  actions: { display: "flex", gap: 12 },
-  actionsWrap: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 },
-  answer: {
-    flex: 1,
-    border: 0,
-    borderRadius: 12,
-    padding: "13px 18px",
-    background: "#16a34a",
-    color: "#fff",
-    fontWeight: 700,
-    cursor: "pointer",
-  },
-  decline: {
-    flex: 1,
-    border: "1px solid #e4e7ec",
-    borderRadius: 12,
-    padding: "13px 18px",
-    background: "#fff",
-    color: "#b42318",
-    fontWeight: 700,
-    cursor: "pointer",
-  },
-  secondary: {
-    border: "1px solid #d0d5dd",
-    borderRadius: 12,
-    padding: "12px 10px",
-    background: "#fff",
-    color: "#344054",
-    fontWeight: 700,
-    cursor: "pointer",
-  },
-  transfer: {
-    border: 0,
-    borderRadius: 12,
-    padding: "12px 10px",
-    background: "#0738F9",
-    color: "#fff",
-    fontWeight: 700,
-    cursor: "pointer",
-  },
-  hangup: {
-    border: 0,
-    borderRadius: 12,
-    padding: "12px 10px",
-    background: "#dc2626",
-    color: "#fff",
-    fontWeight: 700,
-    cursor: "pointer",
-  },
-  promptButton: {
-    width: "100%",
-    marginTop: 9,
-    border: 0,
-    borderRadius: 10,
-    padding: "10px 12px",
-    background: "#111827",
-    color: "#fff",
-    fontWeight: 700,
-    cursor: "pointer",
-  },
-  linkButton: {
-    marginTop: 6,
-    padding: 0,
-    border: 0,
-    background: "transparent",
-    color: "#475467",
-    cursor: "pointer",
-  },
+  backdrop: { position: "fixed", inset: 0, zIndex: 9999, display: "grid", placeItems: "center", padding: 20, background: "rgba(15,23,42,.58)", backdropFilter: "blur(7px)" },
+  dialog: { width: "min(520px,100%)", maxHeight: "calc(100vh - 40px)", overflowY: "auto", background: "white", padding: 28, borderRadius: 22, boxShadow: "0 25px 80px rgba(15,23,42,.32)", textAlign: "center" },
+  icon: { width: 66, height: 66, margin: "0 auto 15px", borderRadius: "50%", display: "grid", placeItems: "center", background: "#e8eeff", color: "#0738F9", fontWeight: 800, fontSize: 17 },
+  eyebrow: { color: "#64748b", fontSize: 13 },
+  description: { color: "#64748b", lineHeight: 1.5, margin: "8px 0 18px" },
+  panel: { background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 13, padding: 13, marginBottom: 13, textAlign: "left" },
+  label: { display: "block", color: "#334155", fontWeight: 700, fontSize: 12, marginBottom: 6 },
+  input: { width: "100%", boxSizing: "border-box", border: "1px solid #cbd5e1", borderRadius: 9, padding: 10, font: "inherit" },
+  transcript: { background: "#f1f5f9", borderRadius: 12, padding: 12, marginBottom: 15, textAlign: "left", maxHeight: 150, overflowY: "auto" },
+  line: { color: "#475569", fontSize: 12, lineHeight: 1.45, marginTop: 5 },
+  actions: { display: "flex", gap: 10 },
+  connectedActions: { display: "grid", gridTemplateColumns: "1fr 1.2fr 1fr", gap: 8 },
+  answer: { flex: 1, border: 0, borderRadius: 11, padding: 13, background: "#16a34a", color: "white", fontWeight: 750 },
+  decline: { flex: 1, border: "1px solid #d8dee8", borderRadius: 11, padding: 13, background: "white", color: "#b42318", fontWeight: 750 },
+  transfer: { border: 0, borderRadius: 11, padding: 12, background: "#0738F9", color: "white", fontWeight: 750 },
+  hangup: { border: 0, borderRadius: 11, padding: 12, background: "#dc2626", color: "white", fontWeight: 750 },
 };
