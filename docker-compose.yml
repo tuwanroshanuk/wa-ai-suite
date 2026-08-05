@@ -55,13 +55,13 @@ services:
       - REDIS_URL=redis://redis:6379
       - TTS_SERVICE_URL=http://tts-service:6000
       - STT_SERVICE_URL=http://stt-service:7000
-      - STT_PROVIDER=${STT_PROVIDER:-local}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      - STT_PROVIDER=local
       - WEBRTC_PUBLIC_IP=${WEBRTC_PUBLIC_IP:-62.171.189.222}
       - WEBRTC_ICE_MIN_PORT=50000
       - WEBRTC_ICE_MAX_PORT=50010
       - WEBRTC_FAST_ICE_WAIT_MS=200
       - AGENT_RING_TIMEOUT_MS=${AGENT_RING_TIMEOUT_MS:-15000}
+      - IVR_TRANSFER_TIMEOUT_MS=${IVR_TRANSFER_TIMEOUT_MS:-20000}
     ports:
       - "50000-50010:50000-50010/udp"
     volumes:
