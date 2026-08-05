@@ -15,7 +15,6 @@ import flowRoutes from "./routes/flows.js";
 import callRoutes from "./routes/calls.js";
 import audioRoutes from "./routes/audio.js";
 import voiceSettingsRoutes from "./routes/voiceSettings.js";
-import aiAgentRoutes from "./routes/aiAgent.js";
 import { reconcileStaleCalls } from "./services/callHandler.js";
 
 const app = express();
@@ -23,7 +22,6 @@ const corsOptions = expressCorsOptions();
 
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
-
 app.use(
   express.json({
     limit: "2mb",
@@ -33,32 +31,37 @@ app.use(
   })
 );
 
-app.get("/health", (req, res) => res.json({ status: "ok" }));
+app.get("/health", (req, res) =>
+  res.json({
+    status: "ok",
+    callAutomation: "visual_ivr",
+    speechToText: "local_faster_whisper",
+    textToSpeech: "local_piper",
+    generativeAi: false,
+  })
+);
 
 app.use("/auth", authRoutes);
 app.use("/webhook", webhookRoutes);
-
 app.use("/api/conversations", requireAuth, conversationRoutes);
 app.use("/api/contacts", requireAuth, contactRoutes);
 app.use("/api/flows", requireAuth, flowRoutes);
 app.use("/api/calls", requireAuth, callRoutes);
 app.use("/api/audio", requireAuth, audioRoutes);
 app.use("/api/voice-settings", requireAuth, voiceSettingsRoutes);
-app.use("/api/ai-agent", requireAuth, aiAgentRoutes);
 
 const server = http.createServer(app);
 initSockets(server);
-
 const PORT = process.env.PORT || 4000;
 
 async function start() {
   await initDb();
   await bootstrapAdmin();
   await reconcileStaleCalls();
-  server.listen(PORT, () => console.log(`[server] listening on :${PORT}`));
+  server.listen(PORT, () => console.log(`[server] listening on :${PORT} with visual IVR`));
 }
 
-start().catch((err) => {
-  console.error("[server] failed to start", err);
+start().catch((error) => {
+  console.error("[server] failed to start", error);
   process.exit(1);
 });
