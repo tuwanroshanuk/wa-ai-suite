@@ -10,17 +10,22 @@ import {
 import { query } from "../db/index.js";
 import { preAcceptCall, acceptCall, rejectCall, terminateCall } from "./whatsapp.js";
 import { synthesizeWithMetadata } from "./tts.js";
-import { generateReply, transcribeAudio } from "./gemini.js";
-import { createGeminiLiveSession } from "./geminiLive.js";
-import { getAiAgentRuntime } from "./aiAgent.js";
+import { transcribeAudio } from "./stt.js";
 import { startLiveTranscriber } from "./callTranscriber.js";
 import { startCallRecorder, noCallRecorder } from "./callRecorder.js";
+import {
+  getIvrSession,
+  handleIvrInput,
+  startIvrSession,
+  stopIvrSession,
+} from "./ivrEngine.js";
 import { emitToDashboard, getOnlineAgentCount } from "../sockets.js";
 
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || "/app/recordings";
 fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
 const AGENT_RING_TIMEOUT_MS = Number(process.env.AGENT_RING_TIMEOUT_MS || 15000);
+const IVR_TRANSFER_TIMEOUT_MS = Number(process.env.IVR_TRANSFER_TIMEOUT_MS || 20000);
 const ICE_MIN_PORT = Number(process.env.WEBRTC_ICE_MIN_PORT || 50000);
 const ICE_MAX_PORT = Number(process.env.WEBRTC_ICE_MAX_PORT || 50010);
 const FAST_ICE_WAIT_MS = Number(process.env.WEBRTC_FAST_ICE_WAIT_MS || 200);
@@ -31,7 +36,6 @@ function makePeerConnection() {
   const iceServers = process.env.WEBRTC_STUN_URL
     ? [{ urls: process.env.WEBRTC_STUN_URL }]
     : [{ urls: "stun:stun.l.google.com:19302" }];
-
   const config = {
     iceServers,
     icePortRange: [ICE_MIN_PORT, ICE_MAX_PORT],
@@ -49,11 +53,9 @@ function makePeerConnection() {
       ],
     },
   };
-
   if (process.env.WEBRTC_PUBLIC_IP) {
     config.iceAdditionalHostAddresses = [process.env.WEBRTC_PUBLIC_IP];
   }
-
   return new RTCPeerConnection(config);
 }
 
@@ -98,21 +100,11 @@ function closePeer(pc) {
 async function appendTranscript(session, role, text, extra = {}) {
   const value = String(text || "").replace(/\s+/g, " ").trim();
   if (!value) return;
-
-  const entry = {
-    role,
-    text: value,
-    at: new Date().toISOString(),
-    ...extra,
-  };
-
+  const entry = { role, text: value, at: new Date().toISOString(), ...extra };
   await query(
-    `UPDATE calls
-        SET transcript = COALESCE(transcript,'[]'::jsonb) || $1::jsonb
-      WHERE id=$2`,
+    `UPDATE calls SET transcript=COALESCE(transcript,'[]'::jsonb) || $1::jsonb WHERE id=$2`,
     [JSON.stringify([entry]), session.call.id]
   );
-
   emitToDashboard("call:transcript", {
     id: session.call.id,
     waCallId: session.call.wa_call_id,
@@ -120,8 +112,8 @@ async function appendTranscript(session, role, text, extra = {}) {
   });
 }
 
-function emitAiStatus(session, state, detail = {}) {
-  emitToDashboard("call:ai-status", {
+function emitIvrStatus(session, state, detail = {}) {
+  emitToDashboard("call:ivr-status", {
     id: session.call.id,
     waCallId: session.call.wa_call_id,
     state,
@@ -131,74 +123,28 @@ function emitAiStatus(session, state, detail = {}) {
 
 async function processCallerTurn(waCallId, wavBuffer) {
   const session = sessions.get(waCallId);
-  if (!session || session.aiEngine === "gemini_live") return;
+  if (!session) return;
 
   let transcript;
   try {
     transcript = await transcribeAudio(wavBuffer, "audio/wav");
-  } catch (err) {
-    console.error(`[call ${waCallId}] local caller transcription failed`, {
-      status: err.response?.status,
-      data: err.response?.data,
-      message: err.message,
+  } catch (error) {
+    console.error(`[call ${waCallId}] local transcription failed`, {
+      status: error.response?.status,
+      data: error.response?.data,
+      message: error.message,
     });
-    emitAiStatus(session, "transcription_error", { error: err.message });
+    emitIvrStatus(session, "transcription_error", { error: error.message });
     return;
   }
 
-  if (!transcript || transcript.length < 2) return;
+  if (!transcript || transcript.length < 1) return;
   console.log(`[call ${waCallId}] caller transcript: ${transcript}`);
   await appendTranscript(session, "caller", transcript, { source: "local_whisper" });
 
-  if (session.mode !== "bot") return;
-
-  const runtime = await getAiAgentRuntime(transcript);
-  if (!runtime.settings.enabled) return;
-
-  session.aiHistory.push({ role: "user", text: transcript });
-  session.aiHistory = session.aiHistory.slice(-16);
-
-  let reply;
-  try {
-    emitAiStatus(session, "thinking", { model: runtime.settings.textModel });
-    reply = await generateReply(session.aiHistory, runtime.systemPrompt, {
-      model: runtime.settings.textModel,
-      maxOutputTokens: 300,
-    });
-  } catch (err) {
-    const apiMessage = err.response?.data?.error?.message || err.message;
-    console.error(`[call ${waCallId}] AI reply generation failed`, {
-      status: err.response?.status,
-      data: err.response?.data,
-      message: apiMessage,
-    });
-    emitAiStatus(session, "model_error", {
-      status: err.response?.status,
-      error: apiMessage,
-    });
-
-    if (!session.aiUnavailableAnnounced) {
-      session.aiUnavailableAnnounced = true;
-      try {
-        await playCallTts(waCallId, runtime.settings.fallbackMessage, "ai_unavailable");
-      } catch (_) {}
-    }
-    return;
-  }
-
-  if (!reply) return;
-  session.aiHistory.push({ role: "assistant", text: reply });
-  session.aiHistory = session.aiHistory.slice(-16);
-  await appendTranscript(session, "assistant", reply, {
-    source: runtime.settings.textModel,
-  });
-
-  try {
-    await playCallTts(waCallId, reply, "ai_reply");
-    emitAiStatus(session, "listening", { engine: "standard" });
-  } catch (err) {
-    console.error(`[call ${waCallId}] AI voice reply failed`, err);
-    emitAiStatus(session, "voice_error", { error: err.message });
+  if (session.mode === "ivr") {
+    const consumed = await handleIvrInput(waCallId, transcript);
+    if (!consumed) emitIvrStatus(session, "input_ignored", { transcript });
   }
 }
 
@@ -207,9 +153,6 @@ function startTranscriptionForSession(waCallId, session) {
     waCallId,
     recordingsDir: RECORDINGS_DIR,
     onTurn: (wavBuffer) => processCallerTurn(waCallId, wavBuffer),
-    onPcmChunk: (chunk) => {
-      try { session.liveSession?.sendAudio(chunk); } catch (_) {}
-    },
   })
     .then((transcriber) => {
       if (sessions.get(waCallId) !== session) {
@@ -217,108 +160,114 @@ function startTranscriptionForSession(waCallId, session) {
         return;
       }
       session.transcriber = transcriber;
+      console.log(`[call ${waCallId}] local IVR transcription ready`);
     })
-    .catch((err) => {
-      console.error(`[call ${waCallId}] live caller audio decoder could not start`, err);
+    .catch((error) => {
+      console.error(`[call ${waCallId}] caller audio decoder could not start`, error);
     });
 }
 
-async function startPcmToWhatsApp(session) {
-  const receiver = dgram.createSocket("udp4");
-  await new Promise((resolve, reject) => {
-    receiver.once("error", reject);
-    receiver.bind(0, "127.0.0.1", resolve);
-  });
-  const port = receiver.address().port;
+async function offerCallToAgents(session, source = "ivr_transfer") {
+  const waCallId = session.call.wa_call_id;
+  stopIvrSession(waCallId);
+  session.mode = "ringing";
+  session.decided = false;
+  session.acceptedBy = null;
+  clearTimeout(session.ringTimer);
 
-  receiver.on("message", (data) => {
+  await query("UPDATE calls SET status='ringing',handled_by='unassigned' WHERE id=$1", [session.call.id]);
+  emitToDashboard("call:incoming", {
+    id: session.call.id,
+    waCallId,
+    contact: {
+      id: session.contact.id,
+      name: session.contact.name,
+      wa_id: session.contact.wa_id,
+    },
+    startedAt: session.call.started_at,
+    autoTransferAt: new Date(Date.now() + IVR_TRANSFER_TIMEOUT_MS).toISOString(),
+    ringTimeoutMs: IVR_TRANSFER_TIMEOUT_MS,
+    transcript: [],
+    source,
+    alreadyAccepted: true,
+  });
+  emitToDashboard("call:updated", {
+    id: session.call.id,
+    waCallId,
+    status: "ringing",
+    handled_by: "unassigned",
+    transfer_source: source,
+  });
+
+  if (getOnlineAgentCount() === 0) {
+    await playCallTts(waCallId, "No agent is currently available. Please call again later.", "ivr:no_agent");
+    setImmediate(() => endCall(waCallId).catch(() => {}));
+    return;
+  }
+
+  session.ringTimer = setTimeout(async () => {
+    const active = sessions.get(waCallId);
+    if (!active || active.mode !== "ringing") return;
     try {
-      const packet = RtpPacket.deSerialize(data);
-      packet.header.payloadType = 111;
-      session.recorder.feedOutbound(packet);
-      session.outboundTrack.writeRtp(packet);
-    } catch (err) {
-      console.warn(`[call ${session.call.wa_call_id}] invalid Gemini audio RTP`, err.message);
+      await playCallTts(waCallId, "No agent answered. Please call again later.", "ivr:agent_timeout");
+    } finally {
+      setImmediate(() => endCall(waCallId).catch(() => {}));
     }
-  });
-
-  const ffmpeg = spawn("ffmpeg", [
-    "-hide_banner", "-loglevel", "warning",
-    "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0",
-    "-vn", "-acodec", "libopus", "-ar", "48000", "-ac", "2",
-    "-application", "voip", "-frame_duration", "20", "-payload_type", "111",
-    "-f", "rtp", `rtp://127.0.0.1:${port}`,
-  ]);
-
-  ffmpeg.stderr.on("data", (chunk) => {
-    const text = chunk.toString().trim();
-    if (text) console.warn(`[call ${session.call.wa_call_id}] Gemini audio encoder: ${text}`);
-  });
-  ffmpeg.once("error", (err) => {
-    console.error(`[call ${session.call.wa_call_id}] Gemini audio encoder failed`, err);
-  });
-
-  let closed = false;
-  return {
-    write(pcm24k) {
-      if (closed || !pcm24k?.length || ffmpeg.stdin.destroyed) return;
-      try { ffmpeg.stdin.write(pcm24k); } catch (_) {}
-    },
-    close() {
-      if (closed) return;
-      closed = true;
-      try { ffmpeg.stdin.end(); } catch (_) {}
-      setTimeout(() => {
-        try { ffmpeg.kill("SIGINT"); } catch (_) {}
-        try { receiver.close(); } catch (_) {}
-      }, 250);
-    },
-  };
+  }, IVR_TRANSFER_TIMEOUT_MS);
 }
 
-async function startGeminiLiveForSession(waCallId, session, runtime) {
-  const writer = await startPcmToWhatsApp(session);
-  session.liveAudioWriter = writer;
+async function startVisualIvr(waCallId, { announcement, reason, source = "automatic_timeout" } = {}) {
+  const session = sessions.get(waCallId);
+  if (!session) throw new Error("Call session is no longer available.");
+  clearTimeout(session.ringTimer);
+  session.decided = true;
 
-  const live = await createGeminiLiveSession({
-    model: runtime.settings.liveModel,
-    voice: runtime.settings.liveVoice,
-    thinkingLevel: runtime.settings.thinkingLevel,
-    systemPrompt: runtime.systemPrompt,
-    onAudio: (audio) => writer.write(audio),
-    onInputTranscript: (text) => {
-      appendTranscript(session, "caller", text, { source: "gemini_live" }).catch((err) =>
-        console.error(`[call ${waCallId}] live input transcript save failed`, err)
-      );
-    },
-    onOutputTranscript: (text) => {
-      appendTranscript(session, "assistant", text, {
-        source: runtime.settings.liveModel,
-      }).catch((err) =>
-        console.error(`[call ${waCallId}] live output transcript save failed`, err)
-      );
-    },
-    onInterrupted: () => emitAiStatus(session, "interrupted"),
-    onError: (err) => {
-      console.error(`[call ${waCallId}] Gemini Live error`, err);
-      emitAiStatus(session, "live_error", { error: err.message });
-    },
-    onClose: ({ code, reason }) => {
-      console.warn(`[call ${waCallId}] Gemini Live closed code=${code} reason=${reason}`);
-      emitAiStatus(session, "live_closed", { code, reason });
-    },
-  });
+  closePeer(session.agentPc);
+  session.agentPc = null;
+  session.agentOutboundTrack = null;
 
-  session.liveSession = live;
-  emitAiStatus(session, "listening", {
-    engine: "gemini_live",
-    model: runtime.settings.liveModel,
-    voice: runtime.settings.liveVoice,
-  });
-  console.log(
-    `[call ${waCallId}] Gemini Live connected model=${runtime.settings.liveModel} voice=${runtime.settings.liveVoice}`
+  if (!session.whatsappAccepted) {
+    console.log(`[call ${waCallId}] sending final accept for visual IVR`);
+    await acceptCall(waCallId);
+    session.whatsappAccepted = true;
+  }
+
+  session.acceptedBy = "ivr";
+  session.mode = "ivr";
+  const result = await query(
+    "UPDATE calls SET status='connected',handled_by='ivr' WHERE id=$1 RETURNING *",
+    [session.call.id]
   );
-  return live;
+  emitToDashboard("call:updated", {
+    id: session.call.id,
+    waCallId,
+    status: "connected",
+    handled_by: "ivr",
+    transfer_source: source,
+    reason: reason || null,
+  });
+
+  const connected = await waitForConnected(session.pc);
+  console.log(`[call ${waCallId}] visual IVR started; media connected=${connected}`);
+  emitIvrStatus(session, "starting", { source });
+
+  await startIvrSession({
+    waCallId,
+    callId: session.call.id,
+    contact: session.contact,
+    announcement,
+    actions: {
+      speak: (text, nodeSource) => playCallTts(waCallId, text, nodeSource),
+      transferAgent: ({ team }) => offerCallToAgents(session, `ivr:${team || "all"}`),
+      end: (endReason) => {
+        emitIvrStatus(session, "finished", { reason: endReason });
+        setTimeout(() => endCall(waCallId).catch((error) =>
+          console.error(`[call ${waCallId}] IVR end failed`, error)
+        ), 250);
+      },
+    },
+  });
+  return result.rows[0] || session.call;
 }
 
 export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
@@ -327,11 +276,9 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
   const inserted = await query(
     `INSERT INTO calls (contact_id,wa_call_id,direction,handled_by,status,consent_status)
      VALUES ($1,$2,'inbound','unassigned','ringing','not_required')
-     ON CONFLICT (wa_call_id) DO NOTHING
-     RETURNING *`,
+     ON CONFLICT (wa_call_id) DO NOTHING RETURNING *`,
     [contact.id, waCallId]
   );
-
   let call = inserted.rows[0];
   if (!call) {
     const existing = await query("SELECT * FROM calls WHERE wa_call_id=$1", [waCallId]);
@@ -341,7 +288,6 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
 
   let pc;
   let sessionRef = null;
-
   try {
     console.log(`[call ${waCallId}] preparing WebRTC answer`);
     pc = makePeerConnection();
@@ -358,10 +304,9 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
         try { sessionRef?.agentOutboundTrack?.writeRtp(rtp); } catch (_) {}
       });
     });
-
-    pc.connectionStateChange.subscribe((state) => {
-      console.log(`[call ${waCallId}] WhatsApp WebRTC state: ${state}`);
-    });
+    pc.connectionStateChange.subscribe((state) =>
+      console.log(`[call ${waCallId}] WhatsApp WebRTC state: ${state}`)
+    );
 
     await pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
     await pc.setLocalDescription(await pc.createAnswer());
@@ -382,12 +327,8 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
       ringTimer: null,
       decided: false,
       acceptedBy: null,
+      whatsappAccepted: false,
       mode: "ringing",
-      aiEngine: null,
-      aiHistory: [],
-      aiUnavailableAnnounced: false,
-      liveSession: null,
-      liveAudioWriter: null,
       ttsQueue: Promise.resolve(),
       autoTransferAt,
     };
@@ -400,14 +341,10 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
 
     startCallRecorder({ waCallId, recordingsDir: RECORDINGS_DIR })
       .then((recorder) => {
-        if (sessions.get(waCallId) !== session) {
-          recorder.stop();
-          return;
-        }
+        if (sessions.get(waCallId) !== session) return recorder.stop();
         session.recorder = recorder;
       })
-      .catch((err) => console.error(`[call ${waCallId}] recording could not start`, err));
-
+      .catch((error) => console.error(`[call ${waCallId}] recording could not start`, error));
     startTranscriptionForSession(waCallId, session);
 
     if (getOnlineAgentCount() > 0) {
@@ -422,26 +359,25 @@ export async function handleIncomingCall({ waCallId, offerSdp, contact }) {
       });
       console.log(`[call ${waCallId}] incoming-call popup emitted to dashboard`);
       session.ringTimer = setTimeout(() => {
-        answerWithBot(waCallId).catch((err) =>
-          console.error(`[call ${waCallId}] automatic AI answer failed`, err)
+        startVisualIvr(waCallId, { source: "automatic_timeout" }).catch((error) =>
+          console.error(`[call ${waCallId}] automatic IVR answer failed`, error)
         );
       }, AGENT_RING_TIMEOUT_MS);
     } else {
-      console.log(`[call ${waCallId}] no agent online; accepting with AI immediately`);
-      setImmediate(() => answerWithBot(waCallId));
+      console.log(`[call ${waCallId}] no agent online; accepting with visual IVR immediately`);
+      setImmediate(() => startVisualIvr(waCallId, { source: "no_agent_online" }));
     }
-
     return call;
-  } catch (err) {
+  } catch (error) {
     console.error(`[call ${waCallId}] setup failed`, {
-      status: err.response?.status,
-      data: err.response?.data,
-      message: err.message,
-      stack: err.stack,
+      status: error.response?.status,
+      data: error.response?.data,
+      message: error.message,
+      stack: error.stack,
     });
     closePeer(pc);
-    await failCall(waCallId, call.id, err);
-    throw err;
+    await failCall(waCallId, call.id, error);
+    throw error;
   }
 }
 
@@ -449,9 +385,9 @@ export async function claimCallAsAgent(waCallId, user, browserOfferSdp) {
   const session = sessions.get(waCallId);
   if (!session || session.decided) throw new Error("Call is no longer available.");
   if (!browserOfferSdp) throw new Error("Browser microphone WebRTC offer is required.");
-
   session.decided = true;
   clearTimeout(session.ringTimer);
+  stopIvrSession(waCallId);
 
   let agentPc;
   try {
@@ -459,7 +395,6 @@ export async function claimCallAsAgent(waCallId, user, browserOfferSdp) {
     agentPc = makePeerConnection();
     const agentOutboundTrack = new MediaStreamTrack({ kind: "audio" });
     agentPc.addTransceiver(agentOutboundTrack, { direction: "sendrecv" });
-
     agentPc.onTrack.subscribe((track) => {
       if (track.kind !== "audio") return;
       console.log(`[call ${waCallId}] agent microphone track received`);
@@ -468,30 +403,24 @@ export async function claimCallAsAgent(waCallId, user, browserOfferSdp) {
         try { session.outboundTrack.writeRtp(rtp); } catch (_) {}
       });
     });
-
     agentPc.connectionStateChange.subscribe((state) => {
       console.log(`[call ${waCallId}] agent WebRTC state: ${state}`);
-      emitToDashboard("call:agent-media", {
-        id: session.call.id,
-        waCallId,
-        state,
-      });
+      emitToDashboard("call:agent-media", { id: session.call.id, waCallId, state });
     });
 
     await agentPc.setRemoteDescription({ type: "offer", sdp: browserOfferSdp });
     await agentPc.setLocalDescription(await agentPc.createAnswer());
     await waitForIce(agentPc, AGENT_ICE_WAIT_MS);
-    if (!agentPc.localDescription?.sdp) {
-      throw new Error("Agent WebRTC answer SDP was not generated.");
-    }
+    if (!agentPc.localDescription?.sdp) throw new Error("Agent WebRTC answer SDP was not generated.");
 
     session.agentPc = agentPc;
     session.agentOutboundTrack = agentOutboundTrack;
     session.acceptedBy = `agent:${user.id}`;
     session.mode = "agent";
-    session.aiEngine = null;
-
-    await acceptCall(waCallId);
+    if (!session.whatsappAccepted) {
+      await acceptCall(waCallId);
+      session.whatsappAccepted = true;
+    }
 
     const result = await query(
       "UPDATE calls SET status='connected',handled_by=$1 WHERE id=$2 RETURNING *",
@@ -503,102 +432,26 @@ export async function claimCallAsAgent(waCallId, user, browserOfferSdp) {
       status: "connected",
       handled_by: session.acceptedBy,
     });
-
     console.log(`[call ${waCallId}] agent accepted; browser bridge SDP returned`);
     return { call: result.rows[0] || session.call, answerSdp: agentPc.localDescription.sdp };
-  } catch (err) {
+  } catch (error) {
     closePeer(agentPc);
     session.agentPc = null;
     session.agentOutboundTrack = null;
     session.acceptedBy = null;
     session.mode = "ringing";
     session.decided = false;
-    setImmediate(() => {
-      answerWithBot(waCallId).catch((botErr) =>
-        console.error(`[call ${waCallId}] agent bridge and AI fallback failed`, botErr)
-      );
-    });
-    throw err;
+    setImmediate(() => startVisualIvr(waCallId, { source: "agent_bridge_failure" }).catch(() => {}));
+    throw error;
   }
 }
 
-export async function transferCallToBot(
-  waCallId,
-  { announcement, reason, source = "manual" } = {}
-) {
-  const session = sessions.get(waCallId);
-  if (!session) throw new Error("Call session is no longer available.");
-
-  clearTimeout(session.ringTimer);
-  session.decided = true;
-
-  if (session.mode === "bot") return session.call;
-
-  const wasAccepted = Boolean(session.acceptedBy);
-  closePeer(session.agentPc);
-  session.agentPc = null;
-  session.agentOutboundTrack = null;
-
-  if (!wasAccepted) {
-    console.log(`[call ${waCallId}] sending final accept for AI bot`);
-    await acceptCall(waCallId);
-  }
-
-  session.acceptedBy = "bot";
-  session.mode = "bot";
-  const result = await query(
-    "UPDATE calls SET status='connected',handled_by='bot' WHERE id=$1 RETURNING *",
-    [session.call.id]
-  );
-  emitToDashboard("call:updated", {
-    id: session.call.id,
-    waCallId,
-    status: "connected",
-    handled_by: "bot",
-    transfer_source: source,
-    reason: reason || null,
-  });
-
-  const connected = await waitForConnected(session.pc);
-  console.log(`[call ${waCallId}] transferred to AI; media connected=${connected}`);
-
-  const runtime = await getAiAgentRuntime("", { allKnowledge: true });
-  const spokenAnnouncement = announcement || runtime.settings.greeting;
-  session.aiEngine = runtime.settings.engine;
-
-  if (runtime.settings.engine === "gemini_live") {
-    try {
-      const live = await startGeminiLiveForSession(waCallId, session, runtime);
-      live.sendText(spokenAnnouncement);
-      return result.rows[0] || session.call;
-    } catch (err) {
-      console.error(`[call ${waCallId}] Gemini Live unavailable; using standard pipeline`, {
-        message: err.message,
-        status: err.response?.status,
-      });
-      session.liveSession?.close();
-      session.liveAudioWriter?.close();
-      session.liveSession = null;
-      session.liveAudioWriter = null;
-      session.aiEngine = "standard";
-      emitAiStatus(session, "live_fallback", { error: err.message });
-    }
-  }
-
-  setImmediate(() => {
-    playCallTts(waCallId, spokenAnnouncement, source).catch((err) =>
-      console.error(`[call ${waCallId}] transfer announcement failed`, err)
-    );
-  });
-  emitAiStatus(session, "listening", {
-    engine: "standard",
-    model: runtime.settings.textModel,
-  });
-  return result.rows[0] || session.call;
+export async function transferCallToBot(waCallId, options = {}) {
+  return startVisualIvr(waCallId, options);
 }
 
 export async function answerWithBot(waCallId) {
-  return transferCallToBot(waCallId, { source: "automatic_timeout" });
+  return startVisualIvr(waCallId, { source: "automatic_timeout" });
 }
 
 export async function createAgentPromptAudio(waCallId, text, user) {
@@ -607,7 +460,6 @@ export async function createAgentPromptAudio(waCallId, text, user) {
     throw new Error("An agent-connected call is required to play a browser prompt.");
   }
   if (!text?.trim()) throw new Error("Prompt text is required.");
-
   const result = await synthesizeWithMetadata(text.trim());
   await appendTranscript(session, "agent_prompt", text.trim(), {
     source: `agent:${user.id}`,
@@ -620,11 +472,9 @@ export async function createAgentPromptAudio(waCallId, text, user) {
 async function playCallTts(waCallId, text, source = "tts") {
   const session = sessions.get(waCallId);
   if (!session || !text?.trim()) return;
-
   const task = async () => {
     const active = sessions.get(waCallId);
     if (!active) return;
-
     emitToDashboard("call:prompt-state", {
       id: active.call.id,
       waCallId,
@@ -632,6 +482,7 @@ async function playCallTts(waCallId, text, source = "tts") {
       source,
       text,
     });
+    await appendTranscript(active, "ivr", text, { source });
 
     let receiver;
     try {
@@ -642,15 +493,14 @@ async function playCallTts(waCallId, text, source = "tts") {
         receiver.bind(0, "127.0.0.1", resolve);
       });
       const port = receiver.address().port;
-
       receiver.on("message", (data) => {
         try {
           const packet = RtpPacket.deSerialize(data);
           packet.header.payloadType = 111;
           active.recorder.feedOutbound(packet);
           active.outboundTrack.writeRtp(packet);
-        } catch (err) {
-          console.warn(`[call ${waCallId}] invalid generated RTP packet`, err.message);
+        } catch (error) {
+          console.warn(`[call ${waCallId}] invalid generated RTP packet`, error.message);
         }
       });
 
@@ -660,33 +510,27 @@ async function playCallTts(waCallId, text, source = "tts") {
         "-application", "voip", "-frame_duration", "20", "-payload_type", "111",
         "-f", "rtp", `rtp://127.0.0.1:${port}`,
       ]);
-
       ffmpeg.stderr.on("data", (chunk) => {
         const value = chunk.toString().trim();
         if (value) console.warn(`[call ${waCallId}] TTS encoder: ${value}`);
       });
-
       const completed = new Promise((resolve, reject) => {
-        ffmpeg.once("close", (code) =>
-          code === 0 ? resolve() : reject(new Error(`FFmpeg exited ${code}`))
-        );
+        ffmpeg.once("close", (code) => code === 0 ? resolve() : reject(new Error(`FFmpeg exited ${code}`)));
         ffmpeg.once("error", reject);
       });
-
       ffmpeg.stdin.end(audio);
       await completed;
       console.log(`[call ${waCallId}] TTS finished source=${source} provider=${provider} voice=${voice}`);
     } finally {
       try { receiver?.close(); } catch (_) {}
       emitToDashboard("call:prompt-state", {
-        id: session.call.id,
+        id: active.call.id,
         waCallId,
         state: "idle",
         source,
       });
     }
   };
-
   session.ttsQueue = session.ttsQueue.then(task, task);
   return session.ttsQueue;
 }
@@ -694,15 +538,14 @@ async function playCallTts(waCallId, text, source = "tts") {
 async function closeSessionMedia(session) {
   if (!session) return null;
   clearTimeout(session.ringTimer);
+  stopIvrSession(session.call.wa_call_id);
   session.transcriber?.stop();
-  session.liveSession?.close();
-  session.liveAudioWriter?.close();
   closePeer(session.agentPc);
   closePeer(session.pc);
   try {
     return await session.recorder.stop();
-  } catch (err) {
-    console.error(`[call ${session.call.wa_call_id}] recording finalization failed`, err);
+  } catch (error) {
+    console.error(`[call ${session.call.wa_call_id}] recording finalization failed`, error);
     return null;
   }
 }
@@ -710,7 +553,6 @@ async function closeSessionMedia(session) {
 export async function handleCallTerminated(waCallId, outcome = "terminate") {
   const session = sessions.get(waCallId);
   const recordingPath = await closeSessionMedia(session);
-
   const existing = await query("SELECT id,status FROM calls WHERE wa_call_id=$1", [waCallId]);
   const row = existing.rows[0];
   sessions.delete(waCallId);
@@ -718,17 +560,14 @@ export async function handleCallTerminated(waCallId, outcome = "terminate") {
 
   let finalStatus = "missed";
   if (outcome === "reject") finalStatus = "rejected";
-  else if (row.status === "connected") finalStatus = "ended";
+  else if (row.status === "connected" || session?.whatsappAccepted) finalStatus = "ended";
   else if (row.status === "failed") finalStatus = "failed";
 
   const result = await query(
-    `UPDATE calls
-        SET status=$1,ended_at=COALESCE(ended_at,now()),
-            recording_path=COALESCE($2,recording_path)
+    `UPDATE calls SET status=$1,ended_at=COALESCE(ended_at,now()),recording_path=COALESCE($2,recording_path)
       WHERE wa_call_id=$3 RETURNING id,status,recording_path`,
     [finalStatus, recordingPath, waCallId]
   );
-
   if (result.rows[0]) {
     emitToDashboard("call:updated", {
       id: result.rows[0].id,
@@ -744,19 +583,13 @@ export async function rejectIncomingCall(waCallId, reason) {
   const recordingPath = await closeSessionMedia(session);
   try { await rejectCall(waCallId); } catch (_) {}
   const result = await query(
-    `UPDATE calls
-        SET status='rejected',ended_at=now(),recording_path=COALESCE($2,recording_path)
+    `UPDATE calls SET status='rejected',ended_at=now(),recording_path=COALESCE($2,recording_path)
       WHERE wa_call_id=$1 RETURNING id`,
     [waCallId, recordingPath]
   );
   sessions.delete(waCallId);
   if (result.rows[0]) {
-    emitToDashboard("call:updated", {
-      id: result.rows[0].id,
-      waCallId,
-      status: "rejected",
-      reason,
-    });
+    emitToDashboard("call:updated", { id: result.rows[0].id, waCallId, status: "rejected", reason });
   }
 }
 
@@ -766,14 +599,12 @@ export async function endCall(waCallId) {
   }
 }
 
-async function failCall(waCallId, callId, err) {
+async function failCall(waCallId, callId, error) {
   const session = sessions.get(waCallId);
   const recordingPath = await closeSessionMedia(session);
   try { await rejectCall(waCallId); } catch (_) {}
   await query(
-    `UPDATE calls
-        SET status='failed',ended_at=now(),recording_path=COALESCE($2,recording_path)
-      WHERE id=$1`,
+    `UPDATE calls SET status='failed',ended_at=now(),recording_path=COALESCE($2,recording_path) WHERE id=$1`,
     [callId, recordingPath]
   );
   sessions.delete(waCallId);
@@ -781,28 +612,25 @@ async function failCall(waCallId, callId, err) {
     id: callId,
     waCallId,
     status: "failed",
-    error: err?.response?.data || err?.message || String(err),
+    error: error?.response?.data || error?.message || String(error),
   });
 }
 
 export async function reconcileStaleCalls() {
   const stale = await query(
     `SELECT id,wa_call_id,status FROM calls
-     WHERE (status='ringing' AND started_at < now() - interval '5 minutes')
-        OR (status='connected' AND started_at < now() - interval '12 hours')`
+      WHERE (status='ringing' AND started_at < now() - interval '5 minutes')
+         OR (status='connected' AND started_at < now() - interval '12 hours')`
   );
   for (const row of stale.rows) {
     if (sessions.has(row.wa_call_id)) continue;
     try { await terminateCall(row.wa_call_id); } catch (_) {}
     const status = row.status === "connected" ? "ended" : "missed";
-    await query(
-      "UPDATE calls SET status=$1,ended_at=COALESCE(ended_at,now()) WHERE id=$2",
-      [status, row.id]
-    );
+    await query("UPDATE calls SET status=$1,ended_at=COALESCE(ended_at,now()) WHERE id=$2", [status, row.id]);
     emitToDashboard("call:updated", { id: row.id, waCallId: row.wa_call_id, status });
   }
 }
 
 setInterval(() => {
-  reconcileStaleCalls().catch((err) => console.error("[calls] stale sweep failed", err));
+  reconcileStaleCalls().catch((error) => console.error("[calls] stale sweep failed", error));
 }, 300000);
