@@ -1,185 +1,123 @@
 import { query } from "../db/index.js";
 import { sendText, sendAudio } from "./whatsapp.js";
-import { generateReply } from "./gemini.js";
 
-/**
- * Flow graph shape (built by the React Flow UI, stored as JSON):
- * {
- *   nodes: [
- *     { id, type: 'start'|'message'|'audio'|'menu'|'ai_reply'|'handoff'|'end', data: {...} },
- *     ...
- *   ],
- *   edges: [ { id, source, target, sourceHandle? } ]
- * }
- *
- * Node data by type:
- *  message   -> { text }
- *  audio     -> { assetId, fallbackText }        // pre-recorded free audio clip
- *  menu      -> { text, options: [{label, value}] } // matched against next inbound text
- *  ai_reply  -> { systemPrompt }                  // hands the message to Gemini
- *  handoff   -> { note }                          // marks conversation for a human agent
- *  end       -> {}
- */
-
-function findNode(graph, id) {
-  return graph.nodes.find((n) => n.id === id);
+function nodeById(graph, id) {
+  return (graph.nodes || []).find((node) => node.id === id) || null;
 }
 
-function findStartNode(graph) {
-  return graph.nodes.find((n) => n.type === "start");
+function nextId(graph, id, handle = null) {
+  const edges = (graph.edges || []).filter((edge) => edge.source === id);
+  if (handle !== null) {
+    const exact = edges.find((edge) => String(edge.sourceHandle || "") === String(handle));
+    if (exact) return exact.target;
+  }
+  return edges.find((edge) => ["default", "next"].includes(String(edge.sourceHandle || "")))?.target || edges[0]?.target || null;
 }
 
-function nextNodeId(graph, currentId, handle) {
-  const edge = graph.edges.find(
-    (e) => e.source === currentId && (!handle || e.sourceHandle === handle)
-  );
-  return edge?.target || null;
-}
-
-async function getActiveFlow() {
-  const result = await query(
-    "SELECT * FROM flows WHERE is_active = true ORDER BY updated_at DESC LIMIT 1"
-  );
+async function activeFlow() {
+  const result = await query("SELECT * FROM flows WHERE is_active=true ORDER BY updated_at DESC LIMIT 1");
   return result.rows[0] || null;
 }
 
-async function getAudioAsset(id) {
-  const result = await query("SELECT * FROM audio_assets WHERE id = $1", [id]);
-  return result.rows[0] || null;
-}
-
-async function recordOutbound(conversationId, sender, type, body) {
+async function record(conversationId, type, body) {
   await query(
-    "INSERT INTO messages (conversation_id, direction, sender, type, body) VALUES ($1,'outbound',$2,$3,$4)",
-    [conversationId, sender, type, body]
+    "INSERT INTO messages (conversation_id,direction,sender,type,body) VALUES ($1,'outbound','bot',$2,$3)",
+    [conversationId, type, body]
   );
 }
 
-/**
- * Runs one step of the flow for a given conversation, in response to an inbound
- * customer message. Advances flow_state.currentNodeId and sends whatever the
- * node produces, until it hits a node that needs to wait for the next customer
- * reply (menu) or reaches 'end'/'handoff'.
- */
+async function sendMessage(contact, conversationId, text) {
+  if (!text) return;
+  await sendText(contact.wa_id, text);
+  await record(conversationId, "text", text);
+}
+
 export async function advanceFlow(conversation, contact, inboundText) {
-  const flow = await getActiveFlow();
+  const flow = await activeFlow();
   if (!flow) {
-    // No flow configured -> fall back straight to Gemini as a generic assistant.
-    const reply = await generateReply(
-      [{ role: "user", text: inboundText }],
-      "You are a helpful, concise WhatsApp customer support assistant."
-    );
-    await sendText(contact.wa_id, reply);
-    await recordOutbound(conversation.id, "bot", "text", reply);
+    await sendMessage(contact, conversation.id, "Thanks for your message. An agent will reply as soon as possible.");
+    await query("UPDATE conversations SET status='pending' WHERE id=$1", [conversation.id]);
     return;
   }
 
-  const graph = flow.graph;
-  let state = conversation.flow_state || {};
-  let currentId = state.currentNodeId || findStartNode(graph)?.id;
+  const graph = flow.graph || { nodes: [], edges: [] };
+  const start = (graph.nodes || []).find((node) => node.type === "start");
+  const state = conversation.flow_state || {};
+  let current = state.currentNodeId || start?.id;
+  let node = current ? nodeById(graph, current) : null;
 
-  // If we were waiting on a menu choice, resolve it against the inbound text.
-  const currentNode = currentId ? findNode(graph, currentId) : null;
-  if (currentNode?.type === "menu") {
-    const match = currentNode.data.options?.find(
-      (o) => o.value.toLowerCase() === inboundText.trim().toLowerCase()
+  if (node?.type === "menu") {
+    const input = String(inboundText || "").trim().toLowerCase();
+    const choice = (node.data?.choices || []).find((item) =>
+      [item.value, item.label, ...(item.keywords || [])]
+        .map((value) => String(value || "").toLowerCase())
+        .some((value) => value && (input === value || input.includes(value)))
     );
-    currentId = nextNodeId(graph, currentNode.id, match ? match.value : "default");
-  } else if (!currentId) {
-    currentId = findStartNode(graph)?.id;
+    current = nextId(graph, node.id, choice?.value || "default");
+  } else if (node?.type === "collect") {
+    state.variables = { ...(state.variables || {}), [node.data?.variable || "answer"]: inboundText };
+    current = nextId(graph, node.id);
   }
 
-  // Walk forward through non-interactive nodes until we hit one that needs
-  // to pause (menu) or terminates (end/handoff).
   let guard = 0;
-  while (currentId && guard < 25) {
-    guard++;
-    const node = findNode(graph, currentId);
+  while (current && guard++ < 60) {
+    node = nodeById(graph, current);
     if (!node) break;
 
     if (node.type === "start") {
-      currentId = nextNodeId(graph, node.id);
+      current = nextId(graph, node.id);
       continue;
     }
 
-    if (node.type === "message") {
-      await sendText(contact.wa_id, node.data.text);
-      await recordOutbound(conversation.id, "bot", "text", node.data.text);
-      currentId = nextNodeId(graph, node.id);
+    if (node.type === "speak" || node.type === "message") {
+      await sendMessage(contact, conversation.id, node.data?.text || "");
+      current = nextId(graph, node.id);
       continue;
     }
 
     if (node.type === "audio") {
-      const asset = node.data.assetId ? await getAudioAsset(node.data.assetId) : null;
+      const asset = node.data?.assetId
+        ? (await query("SELECT * FROM audio_assets WHERE id=$1", [node.data.assetId])).rows[0]
+        : null;
       if (asset) {
-        // In production, host recordings/ over HTTPS and pass the public URL here.
         await sendAudio(contact.wa_id, asset.file_path);
-        await recordOutbound(conversation.id, "bot", "audio", asset.name);
-      } else if (node.data.fallbackText) {
-        await sendText(contact.wa_id, node.data.fallbackText);
-        await recordOutbound(conversation.id, "bot", "text", node.data.fallbackText);
+        await record(conversation.id, "audio", asset.name);
+      } else {
+        await sendMessage(contact, conversation.id, node.data?.fallbackText || "");
       }
-      currentId = nextNodeId(graph, node.id);
+      current = nextId(graph, node.id);
       continue;
     }
 
     if (node.type === "menu") {
-      await sendText(contact.wa_id, node.data.text);
-      await recordOutbound(conversation.id, "bot", "text", node.data.text);
-      state.currentNodeId = node.id; // pause here, wait for reply
-      await query("UPDATE conversations SET flow_state = $1, active_flow_id = $2 WHERE id = $3", [
-        state,
-        flow.id,
-        conversation.id,
-      ]);
+      await sendMessage(contact, conversation.id, node.data?.text || "Please choose an option.");
+      state.currentNodeId = node.id;
+      await query("UPDATE conversations SET flow_state=$1,active_flow_id=$2 WHERE id=$3", [state, flow.id, conversation.id]);
       return;
     }
 
-    if (node.type === "ai_reply") {
-      const history = await query(
-        "SELECT direction, body FROM messages WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 10",
-        [conversation.id]
-      );
-      const chat = history.rows
-        .reverse()
-        .map((m) => ({ role: m.direction === "inbound" ? "user" : "assistant", text: m.body || "" }));
-      chat.push({ role: "user", text: inboundText });
-
-      const reply = await generateReply(chat, node.data.systemPrompt);
-      await sendText(contact.wa_id, reply);
-      await recordOutbound(conversation.id, "bot", "text", reply);
-      currentId = nextNodeId(graph, node.id);
-      continue;
+    if (node.type === "collect") {
+      await sendMessage(contact, conversation.id, node.data?.prompt || "Please provide the requested information.");
+      state.currentNodeId = node.id;
+      await query("UPDATE conversations SET flow_state=$1,active_flow_id=$2 WHERE id=$3", [state, flow.id, conversation.id]);
+      return;
     }
 
-    if (node.type === "handoff") {
-      await query("UPDATE conversations SET status = 'pending' WHERE id = $1", [conversation.id]);
-      if (node.data.note) {
-        await sendText(contact.wa_id, node.data.note);
-        await recordOutbound(conversation.id, "bot", "text", node.data.note);
-      }
-      state.currentNodeId = null;
-      await query("UPDATE conversations SET flow_state = $1 WHERE id = $2", [state, conversation.id]);
+    if (node.type === "transfer" || node.type === "handoff") {
+      await sendMessage(contact, conversation.id, node.data?.message || node.data?.note || "An agent will assist you shortly.");
+      await query("UPDATE conversations SET status='pending',flow_state=$1,active_flow_id=$2 WHERE id=$3", [{ ...state, currentNodeId: null }, flow.id, conversation.id]);
       return;
     }
 
     if (node.type === "end") {
-      state.currentNodeId = null;
-      await query("UPDATE conversations SET flow_state = $1, active_flow_id = $2 WHERE id = $3", [
-        state,
-        flow.id,
-        conversation.id,
-      ]);
+      await sendMessage(contact, conversation.id, node.data?.message || "");
+      await query("UPDATE conversations SET flow_state=$1,active_flow_id=$2 WHERE id=$3", [{ ...state, currentNodeId: null }, flow.id, conversation.id]);
       return;
     }
 
-    break;
+    // Voice-only nodes are skipped safely in text conversations.
+    current = nextId(graph, node.id, node.type === "webhook" ? "success" : null);
   }
 
-  state.currentNodeId = currentId;
-  await query("UPDATE conversations SET flow_state = $1, active_flow_id = $2 WHERE id = $3", [
-    state,
-    flow.id,
-    conversation.id,
-  ]);
+  await query("UPDATE conversations SET flow_state=$1,active_flow_id=$2 WHERE id=$3", [{ ...state, currentNodeId: current }, flow.id, conversation.id]);
 }
