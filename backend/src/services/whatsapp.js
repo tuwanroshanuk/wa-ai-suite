@@ -51,21 +51,25 @@ export async function sendText(to, body) {
   );
 }
 
-export async function sendTemplate(to, templateName, languageCode = "en_US", components = []) {
+export async function sendTemplate(to, templateName, languageCode = "en", components = []) {
   return post(
     "/messages",
     {
       messaging_product: "whatsapp",
-      to,
+      to: String(to || "").replace(/\D/g, ""),
       type: "template",
       template: { name: templateName, language: { code: languageCode }, components },
     },
-    "send template"
+    `send template ${templateName}/${languageCode}`
   );
 }
 
-export async function requestCallPermission(to, templateName = "call_permission_request") {
-  return sendTemplate(to, templateName, "en_US");
+export async function requestCallPermission(
+  to,
+  templateName = process.env.WHATSAPP_CALL_PERMISSION_TEMPLATE || "request_call_permission",
+  languageCode = process.env.WHATSAPP_CALL_PERMISSION_LANGUAGE || "en"
+) {
+  return sendTemplate(to, templateName, languageCode);
 }
 
 export async function markRead(waMessageId) {
