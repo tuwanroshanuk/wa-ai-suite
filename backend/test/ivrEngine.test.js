@@ -36,7 +36,7 @@ test("validates a connected deterministic IVR", () => {
 });
 
 test("routes spoken keywords through menu outputs", async () => {
-  const result = await simulateIvr(graph, ["I need help"]);
+  const result = await simulateIvr(graph, ["help"]);
   assert.equal(result.valid, true);
   assert.deepEqual(result.trace.map((entry) => entry.nodeId), ["start", "menu", "support"]);
 });
